@@ -1,0 +1,178 @@
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
+let
+  cfg = config.services.pam-biometrics;
+  json = pkgs.formats.json { };
+
+  policyFile =
+    pkgs.runCommand "pam-biometrics-policy.json"
+      {
+        nativeBuildInputs = [ cfg.package ];
+        policy = builtins.toJSON ({ version = 1; } // cfg.policy);
+        passAsFile = [ "policy" ];
+      }
+      ''
+        cp "$policyPath" "$out"
+        pam-biometrics policy check "$out"
+      '';
+
+  stateDirectory = "/var/lib/pam-biometrics";
+  socket = "/run/pam-biometrics/socket";
+in
+{
+  options.services.pam-biometrics = {
+    enable = lib.mkEnableOption "the pam-biometrics face daemon and policy";
+
+    package = lib.mkOption {
+      type = lib.types.package;
+      description = "The pam-biometrics package.";
+    };
+
+    camera = {
+      device = lib.mkOption {
+        type = lib.types.str;
+        example = "/dev/v4l/by-id/usb-Example_Webcam-video-index0";
+        description = "The V4L2 device of the camera.";
+      };
+
+      inputFormat = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "mjpeg";
+        description = ''
+          The V4L2 input format. With a value, the daemon also requests the
+          width and height from the camera.
+        '';
+      };
+
+      width = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 640;
+        description = "The frame width in pixels.";
+      };
+
+      height = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 360;
+        description = "The frame height in pixels.";
+      };
+    };
+
+    scanSeconds = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 4;
+      description = "The duration of a face scan.";
+    };
+
+    enrollSeconds = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 6;
+      description = "The duration of an enrollment.";
+    };
+
+    resultTtlSeconds = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 120;
+      description = "The time after which an unused scan result expires.";
+    };
+
+    greeterUser = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "greeter";
+      description = ''
+        A user that can start face scans for any user, for example the user
+        of the login greeter.
+      '';
+    };
+
+    policy = lib.mkOption {
+      inherit (json) type;
+      default = { };
+      example = lib.literalExpression ''
+        {
+          defaults.timeout_seconds = 20;
+          services.polkit-1.on_no_decision = "deny";
+          users.alice.defaults.face.match_distance = 0.4;
+        }
+      '';
+      description = ''
+        The policy. The module writes it to
+        {file}`/etc/pam-biometrics/policy.json` and sets `version` to 1.
+        `pam-biometrics policy check` validates it at build time. See the
+        README for the fields.
+      '';
+    };
+
+    pamRule = lib.mkOption {
+      type = lib.types.str;
+      readOnly = true;
+      default = "auth [success=ok ignore=ignore default=die] ${cfg.package}/lib/security/pam_biometrics.so";
+      defaultText = lib.literalExpression ''"auth [success=ok ignore=ignore default=die] ''${cfg.package}/lib/security/pam_biometrics.so"'';
+      description = ''
+        The PAM line of the biometric step. Put it after the password
+        module of each PAM service that uses it.
+      '';
+    };
+  };
+
+  config = lib.mkIf cfg.enable {
+    environment.systemPackages = [ cfg.package ];
+
+    environment.etc."pam-biometrics/policy.json".source = policyFile;
+
+    systemd.services.pam-biometrics = {
+      description = "Face scans for the pam-biometrics PAM step";
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        ExecStart = lib.escapeShellArgs (
+          [
+            (lib.getExe' cfg.package "pam-biometricsd")
+            "--device"
+            cfg.camera.device
+            "--width"
+            (toString cfg.camera.width)
+            "--height"
+            (toString cfg.camera.height)
+            "--scan-seconds"
+            (toString cfg.scanSeconds)
+            "--enroll-seconds"
+            (toString cfg.enrollSeconds)
+            "--result-ttl"
+            (toString cfg.resultTtlSeconds)
+            "--state-dir"
+            stateDirectory
+            "--policy"
+            "/etc/pam-biometrics/policy.json"
+            "--socket"
+            socket
+          ]
+          ++ lib.optionals (cfg.camera.inputFormat != null) [
+            "--input-format"
+            cfg.camera.inputFormat
+          ]
+          ++ lib.optionals (cfg.greeterUser != null) [
+            "--greeter-user"
+            cfg.greeterUser
+          ]
+        );
+        DynamicUser = true;
+        SupplementaryGroups = [ "video" ];
+        StateDirectory = "pam-biometrics";
+        StateDirectoryMode = "0700";
+        RuntimeDirectory = "pam-biometrics";
+        RuntimeDirectoryMode = "0755";
+        DevicePolicy = "closed";
+        DeviceAllow = [ "char-video4linux rw" ];
+        PrivateNetwork = true;
+        RestrictAddressFamilies = [ "AF_UNIX" ];
+        ProtectHome = true;
+        Restart = "on-failure";
+      };
+    };
+  };
+}

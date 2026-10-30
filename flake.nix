@@ -11,7 +11,7 @@
   };
 
   outputs =
-    inputs@{ flake-parts, ... }:
+    inputs@{ flake-parts, self, ... }:
     flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [
         "x86_64-linux"
@@ -27,6 +27,15 @@
             pam-biometrics = pkgs.callPackage ./nix/packages/pam-biometrics.nix { };
             default = pam-biometrics;
           };
+        };
+
+      flake.nixosModules.default =
+        { lib, pkgs, ... }:
+        {
+          imports = [ ./nix/nixos/pam-biometrics.nix ];
+          services.pam-biometrics.package =
+            lib.mkDefault
+              self.packages.${pkgs.stdenv.hostPlatform.system}.pam-biometrics;
         };
 
       # Development tools do not enter the input closure of package and

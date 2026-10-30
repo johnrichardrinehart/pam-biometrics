@@ -1,6 +1,7 @@
 {
   pkgs,
   package,
+  nixosModules,
 }:
 let
   images = pkgs.callPackage ./images.nix { };
@@ -22,4 +23,6 @@ in
   });
 
   encoding-parity = pkgs.callPackage ./encoding-parity.nix { inherit images package; };
+
+  vm = pkgs.callPackage ./vm.nix { inherit images nixosModules; };
 }

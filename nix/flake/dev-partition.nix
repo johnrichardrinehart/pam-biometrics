@@ -16,7 +16,10 @@
       package = inputs.self.packages.${system}.pam-biometrics;
     in
     {
-      checks = import ../checks { inherit pkgs package; };
+      checks = import ../checks {
+        inherit pkgs package;
+        inherit (inputs.self) nixosModules;
+      };
 
       # One definition drives `nix fmt` and the treefmt Git hook. The hook is
       # also exercised by the sandboxed pre-commit check. Formatters and

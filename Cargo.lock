@@ -875,6 +875,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pam-biometrics-module"
+version = "0.1.0"
+
+[[package]]
 name = "pam-biometrics-policy"
 version = "0.1.0"
 dependencies = [

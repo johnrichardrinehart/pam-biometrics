@@ -4,6 +4,7 @@ members = [
   "crates/cli",
   "crates/daemon",
   "crates/face",
+  "crates/pam-module",
   "crates/policy",
   "crates/protocol",
 ]
@@ -20,7 +21,6 @@ repository = "https://github.com/johnrichardrinehart/pam-biometrics"
 pam-biometrics-face = { path = "crates/face" }
 pam-biometrics-policy = { path = "crates/policy" }
 pam-biometrics-protocol = { path = "crates/protocol" }
-
 
 boon = "0.6"
 clap = { version = "4", features = ["derive"] }

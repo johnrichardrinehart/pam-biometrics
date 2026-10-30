@@ -24,6 +24,7 @@
         flakeCheck = false;
         programs = {
           actionlint.enable = true;
+          clang-format.enable = true;
           deadnix.enable = true;
           nixfmt.enable = true;
           prettier.enable = true;

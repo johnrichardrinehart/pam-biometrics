@@ -1,0 +1,20 @@
+[package]
+name = "pam-biometrics-face"
+description = "Face detection and encoding through dlib, with the defaults of face_recognition"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+cxx.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+cxx-build.workspace = true
+pkg-config.workspace = true
+
+[lints]
+workspace = true

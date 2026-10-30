@@ -8,12 +8,8 @@ use pam_biometrics_policy::{Factor, Outcome};
 use zbus::blocking::{Connection, Proxy};
 use zbus::zvariant::OwnedObjectPath;
 
+use crate::fprintd::{DEVICE_INTERFACE, MANAGER_INTERFACE, MANAGER_PATH, SERVICE};
 use crate::step::{Event, FactorTask, Stop};
-
-const SERVICE: &str = "net.reactivated.Fprint";
-const MANAGER_PATH: &str = "/net/reactivated/Fprint/Manager";
-const MANAGER_INTERFACE: &str = "net.reactivated.Fprint.Manager";
-const DEVICE_INTERFACE: &str = "net.reactivated.Fprint.Device";
 
 /// The message after a wrong finger when tries remain.
 pub const RETRY_MESSAGE: &str = "Fingerprint not recognized. Try again.";

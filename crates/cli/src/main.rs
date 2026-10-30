@@ -5,7 +5,9 @@
 
 mod face;
 mod face_commands;
+mod finger_commands;
 mod fingerprint;
+mod fprintd;
 mod helper;
 mod step;
 
@@ -17,6 +19,8 @@ use pam_biometrics_policy::{DEFAULT_POLICY_PATH, Policy};
 use pam_biometrics_protocol::DEFAULT_SOCKET;
 
 use crate::face_commands::FaceCommand;
+use crate::finger_commands::FingerCommand;
+use crate::fprintd::SystemFprintd;
 
 /// Fingerprint and face factors for PAM.
 #[derive(Debug, Parser)]
@@ -40,6 +44,11 @@ enum Command {
     Face {
         #[command(subcommand)]
         command: FaceCommand,
+    },
+    /// Enroll, verify, delete, and list fingers through fprintd.
+    Finger {
+        #[command(subcommand)]
+        command: FingerCommand,
     },
     /// Check or show the policy.
     Policy {
@@ -119,6 +128,24 @@ fn policy(cli: &Cli, command: &PolicyCommand) -> Result<u8, String> {
     }
 }
 
+/// Runs a finger command against fprintd on the system bus.
+fn finger(command: &FingerCommand) -> Result<u8, String> {
+    let user = current_user()?;
+    let fprintd = match SystemFprintd::connect() {
+        Ok(fprintd) => fprintd,
+        Err(error) => {
+            println!("Failed to connect to the system bus: {}", error.message);
+            return Ok(1);
+        }
+    };
+    Ok(finger_commands::run(
+        command,
+        &fprintd,
+        &user,
+        &mut std::io::stdout().lock(),
+    ))
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match &cli.command {
@@ -127,6 +154,7 @@ fn main() -> ExitCode {
             return ExitCode::from(u8::try_from(code).unwrap_or(1));
         }
         Command::Face { command } => face_commands::run(command, &cli.socket, &cli.policy),
+        Command::Finger { command } => finger(command),
         Command::Policy { command } => policy(&cli, command),
     };
     match result {
@@ -188,6 +216,61 @@ mod tests {
         assert_eq!(cli.socket, Path::new("/tmp/socket"));
         assert!(parse(&["face", "list"]).is_err());
         assert!(parse(&["face", "delete"]).is_err());
+    }
+
+    #[test]
+    fn finger_commands_parse() {
+        let cli = parse(&["finger", "enroll"]).unwrap();
+        assert!(matches!(
+            &cli.command,
+            Command::Finger {
+                command: FingerCommand::Enroll { user: None, finger }
+            } if finger == "right-index-finger"
+        ));
+        let cli = parse(&["finger", "enroll", "alice", "--finger", "left-thumb"]).unwrap();
+        assert!(matches!(
+            &cli.command,
+            Command::Finger {
+                command: FingerCommand::Enroll { user: Some(user), finger }
+            } if user == "alice" && finger == "left-thumb"
+        ));
+        let cli = parse(&["finger", "verify", "--json"]).unwrap();
+        assert!(matches!(
+            &cli.command,
+            Command::Finger {
+                command: FingerCommand::Verify { user: None, finger, json: true }
+            } if finger == "any"
+        ));
+        let cli = parse(&["finger", "verify", "bob", "-f", "right-thumb"]).unwrap();
+        assert!(matches!(
+            &cli.command,
+            Command::Finger {
+                command: FingerCommand::Verify { user: Some(user), finger, json: false }
+            } if user == "bob" && finger == "right-thumb"
+        ));
+        let cli = parse(&["finger", "delete", "alice", "bob", "--finger", "left-thumb"]).unwrap();
+        assert!(matches!(
+            &cli.command,
+            Command::Finger {
+                command: FingerCommand::Delete { users, finger: Some(finger) }
+            } if users == &["alice", "bob"] && finger == "left-thumb"
+        ));
+        let cli = parse(&["finger", "delete", "alice"]).unwrap();
+        assert!(matches!(
+            &cli.command,
+            Command::Finger {
+                command: FingerCommand::Delete { finger: None, .. }
+            }
+        ));
+        let cli = parse(&["finger", "list", "alice", "bob"]).unwrap();
+        assert!(matches!(
+            &cli.command,
+            Command::Finger { command: FingerCommand::List { users } } if users == &["alice", "bob"]
+        ));
+        assert!(parse(&["finger", "list"]).is_err());
+        assert!(parse(&["finger", "delete"]).is_err());
+        assert!(parse(&["finger", "list", "alice", "--finger", "left-thumb"]).is_err());
+        assert!(parse(&["finger", "scan"]).is_err());
     }
 
     #[test]

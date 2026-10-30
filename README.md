@@ -25,12 +25,12 @@ password or reject the attempt.
 
 The project has four parts:
 
-| Part                 | Function                                                                                                                                               |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `pam-biometricsd`    | A daemon that owns the camera and the face models. It scans faces on request and keeps the last result of each user.                                   |
-| `pam-biometrics`     | The command line client and the PAM helper. It enrolls faces, starts scans, and decides the PAM step. It does not link dlib, so it starts fast.        |
-| `pam_biometrics.so`  | A small PAM module. It runs `pam-biometrics pam-helper`, shows the output lines of the helper as PAM messages, and maps the exit code to a PAM result. |
-| `policy.schema.json` | The JSON Schema of the policy file, in `share/pam-biometrics/`.                                                                                        |
+| Part                 | Function                                                                                                                                                    |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pam-biometricsd`    | A daemon that owns the camera and the face models. It scans faces on request and keeps the last result of each user.                                        |
+| `pam-biometrics`     | The command line client and the PAM helper. It enrolls faces and fingers, starts scans, and decides the PAM step. It does not link dlib, so it starts fast. |
+| `pam_biometrics.so`  | A small PAM module. It runs `pam-biometrics pam-helper`, shows the output lines of the helper as PAM messages, and maps the exit code to a PAM result.      |
+| `policy.schema.json` | The JSON Schema of the policy file, in `share/pam-biometrics/`.                                                                                             |
 
 Face scans start on demand only. A key binding runs `pam-biometrics face scan`.
 The daemon scans for a few seconds and stores the result. The PAM step takes
@@ -237,6 +237,27 @@ it is not given.
 | `pam-biometrics face scan [USER]`                 | Starts a background scan. The next PAM step for the user uses the result.                                                                                                          |
 | `pam-biometrics face status [USER] [--service S]` | Prints one line for a lock screen: `Face: scanning…`, `Face: recognized`, `Face: not sure`, `Face: not recognized`, `Face: no face found`, `Face: not enrolled`, or an empty line. |
 | `pam-biometrics face wait [USER] [--service S]`   | Waits for a running scan, then prints the same line as `status`.                                                                                                                   |
+
+### Finger commands
+
+The finger commands talk to fprintd on the system bus. Their output and exit
+codes follow `fprintd-enroll`, `fprintd-verify`, `fprintd-delete`, and
+`fprintd-list`. `USER` is the current user if it is not given. fprintd and
+its polkit rules decide which caller can enroll, verify, or delete fingers of
+other users.
+
+| Command                                                        | Function                                                                                                                                                                                                                                                                            |
+| -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pam-biometrics finger enroll [USER] [--finger NAME]`          | Enrolls a finger on the default device and prints each `Enroll result:` line. The default finger is `right-index-finger`. Exits 0 only on `enroll-completed`.                                                                                                                       |
+| `pam-biometrics finger verify [USER] [--finger NAME] [--json]` | Verifies a finger on the default device and prints each `Verify result:` line. The default finger is `any`, which accepts every enrolled finger. Exits 0 only on `verify-match`. `--json` prints only `{"state": "match", "no-match", or "unavailable", "finger": …, "device": …}`. |
+| `pam-biometrics finger delete USER... [--finger NAME]`         | Deletes all enrolled fingers of each user, or one finger, on every device.                                                                                                                                                                                                          |
+| `pam-biometrics finger list USER...`                           | Lists the enrolled fingers of each user on every device.                                                                                                                                                                                                                            |
+
+The finger names are `left-thumb`, `left-index-finger`, `left-middle-finger`,
+`left-ring-finger`, `left-little-finger`, `right-thumb`,
+`right-index-finger`, `right-middle-finger`, `right-ring-finger`, and
+`right-little-finger`. Without a reader, or without enrolled fingers, the
+commands print the reason and exit 1.
 
 ### Other commands
 

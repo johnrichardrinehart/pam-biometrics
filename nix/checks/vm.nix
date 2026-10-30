@@ -36,6 +36,9 @@ testers.runNixOSTest {
         bob.isNormalUser = true;
       };
 
+      # fprintd runs without a reader. The finger commands report that.
+      services.fprintd.enable = true;
+
       environment.systemPackages = [
         pkgs.ffmpeg-headless
         pkgs.pamtester
@@ -78,6 +81,7 @@ testers.runNixOSTest {
     };
 
   testScript = ''
+    import json
     import time
 
     machine.wait_for_unit("pam-biometrics.service")
@@ -189,6 +193,21 @@ testers.runNixOSTest {
         assert "Face not recognized." in output, output
         assert "Face recognized." in output, output
         assert "successfully authenticated" in output, output
+
+    with subtest("finger commands report a missing reader"):
+        status, output = machine.execute("pam-biometrics finger list alice")
+        assert status == 1, output
+        assert output.strip() == "No devices available", output
+        status, output = machine.execute("pam-biometrics finger enroll alice")
+        assert status == 1, output
+        assert output.strip() == "Impossible to enroll: No devices available", output
+        status, output = machine.execute("pam-biometrics finger verify alice --json")
+        assert status == 1, output
+        assert json.loads(output) == {
+            "state": "unavailable",
+            "finger": "any",
+            "device": None,
+        }, output
 
     machine.succeed("journalctl -u pam-biometrics.service | grep 'scan for alice: finished'")
   '';

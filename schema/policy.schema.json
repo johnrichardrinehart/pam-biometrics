@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/johnrichardrinehart/pam-biometrics/schema/policy.schema.json",
+  "title": "pam-biometrics policy",
+  "description": "Factors and thresholds of the pam-biometrics PAM step. Layers merge in this order: built-in defaults, defaults, services[service], users[user].defaults, users[user].services[service]. Lists replace, objects merge.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version"],
+  "properties": {
+    "version": {
+      "description": "The format version.",
+      "const": 1
+    },
+    "defaults": {
+      "description": "Applies to every service and user.",
+      "$ref": "#/$defs/layer"
+    },
+    "services": {
+      "description": "Applies to one PAM service. The key is the PAM service name.",
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/layer" }
+    },
+    "users": {
+      "description": "Applies to one user. The key is the user name.",
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/user" }
+    }
+  },
+  "$defs": {
+    "user": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "defaults": {
+          "description": "Applies to every service for this user.",
+          "$ref": "#/$defs/layer"
+        },
+        "services": {
+          "description": "Applies to one PAM service for this user.",
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/layer" }
+        }
+      }
+    },
+    "layer": {
+      "description": "A partial settings object. A set field replaces the value of the lower layers.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "factors": {
+          "description": "The enabled factors. An empty list gives no decision at once.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "enum": ["fingerprint", "face"] }
+        },
+        "combine": {
+          "description": "any: one match is sufficient. all: every enabled factor must match.",
+          "enum": ["any", "all"]
+        },
+        "on_no_decision": {
+          "description": "allow: PAM_IGNORE. deny: treat the attempt as a reject.",
+          "enum": ["allow", "deny"]
+        },
+        "timeout_seconds": {
+          "description": "Maximum time that the step waits for the factors.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "prompt": {
+          "description": "Text that the step shows when it starts to wait.",
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "fingerprint": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "max_tries": {
+              "description": "Number of finger scans before a wrong finger rejects the attempt.",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            }
+          }
+        },
+        "face": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "match_distance": {
+              "description": "A best distance at or below this value is a match. The resolved value must not be greater than reject_distance.",
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "reject_distance": {
+              "description": "A best distance above this value can reject the attempt.",
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "min_reject_frames": {
+              "description": "A reject needs a face in at least this many frames.",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            }
+          }
+        }
+      }
+    }
+  }
+}

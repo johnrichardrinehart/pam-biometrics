@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "defaults": {
+    "factors": ["fingerprint", "face"],
+    "combine": "any",
+    "on_no_decision": "allow",
+    "timeout_seconds": 15,
+    "fingerprint": { "max_tries": 3 },
+    "face": {
+      "match_distance": 0.45,
+      "reject_distance": 0.6,
+      "min_reject_frames": 3
+    }
+  },
+  "services": {
+    "sudo": { "factors": ["fingerprint", "face"] },
+    "greetd": { "timeout_seconds": 20 }
+  },
+  "users": {
+    "john": {
+      "defaults": { "face": { "match_distance": 0.4 } },
+      "services": { "polkit-1": { "on_no_decision": "deny" } }
+    }
+  }
+}

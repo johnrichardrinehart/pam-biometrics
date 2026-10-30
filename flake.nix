@@ -20,6 +20,15 @@
 
       imports = [ inputs.flake-parts.flakeModules.partitions ];
 
+      perSystem =
+        { pkgs, ... }:
+        {
+          packages = rec {
+            pam-biometrics = pkgs.callPackage ./nix/packages/pam-biometrics.nix { };
+            default = pam-biometrics;
+          };
+        };
+
       # Development tools do not enter the input closure of package and
       # module consumers.
       partitionedAttrs = {

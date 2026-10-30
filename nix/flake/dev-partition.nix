@@ -9,9 +9,15 @@
     {
       config,
       pkgs,
+      system,
       ...
     }:
+    let
+      package = inputs.self.packages.${system}.pam-biometrics;
+    in
     {
+      checks = import ../checks { inherit pkgs package; };
+
       # One definition drives `nix fmt` and the treefmt Git hook. The hook is
       # also exercised by the sandboxed pre-commit check. Formatters and
       # file-oriented linters belong here, not in git-hooks.
@@ -63,7 +69,13 @@
       };
 
       devShells.default = pkgs.mkShell {
-        packages = [ pkgs.nixd ];
+        inputsFrom = [ package ];
+        packages = [
+          pkgs.clippy
+          pkgs.nixd
+          pkgs.rust-analyzer
+          pkgs.rustfmt
+        ];
         shellHook = config.pre-commit.installationScript;
       };
     };

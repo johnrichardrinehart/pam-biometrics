@@ -1,0 +1,21 @@
+[package]
+name = "pam-biometricsd"
+description = "Camera daemon of pam-biometrics: face scans, enrollment, and models"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+clap.workspace = true
+nix.workspace = true
+pam-biometrics-face.workspace = true
+pam-biometrics-policy.workspace = true
+pam-biometrics-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

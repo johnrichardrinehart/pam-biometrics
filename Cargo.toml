@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/face", "crates/policy", "crates/protocol"]
+members = ["crates/daemon", "crates/face", "crates/policy", "crates/protocol"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,9 +11,16 @@ authors = ["John Rinehart"]
 repository = "https://github.com/johnrichardrinehart/pam-biometrics"
 
 [workspace.dependencies]
+pam-biometrics-face = { path = "crates/face" }
+pam-biometrics-policy = { path = "crates/policy" }
+pam-biometrics-protocol = { path = "crates/protocol" }
+
+
 boon = "0.6"
+clap = { version = "4", features = ["derive"] }
 cxx = "1"
 cxx-build = "1"
+nix = { version = "0.31", features = ["fs", "signal", "socket", "user"] }
 pkg-config = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -2,6 +2,9 @@
   pkgs,
   package,
 }:
+let
+  images = pkgs.callPackage ./images.nix { };
+in
 {
   cargo-test = package.overrideAttrs { doCheck = true; };
 
@@ -17,4 +20,6 @@
       touch "$out"
     '';
   });
+
+  encoding-parity = pkgs.callPackage ./encoding-parity.nix { inherit images package; };
 }

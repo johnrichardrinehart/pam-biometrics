@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/daemon", "crates/face", "crates/policy", "crates/protocol"]
+members = [
+  "crates/cli",
+  "crates/daemon",
+  "crates/face",
+  "crates/policy",
+  "crates/protocol",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -25,6 +31,10 @@ pkg-config = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+zbus = { version = "5", default-features = false, features = [
+  "async-io",
+  "blocking-api",
+] }
 
 [workspace.lints.rust]
 missing_debug_implementations = "warn"

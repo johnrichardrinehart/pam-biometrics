@@ -108,43 +108,43 @@ testers.runNixOSTest {
 
     with subtest("enroll from one photo"):
         show("${images.obama}")
-        output = machine.succeed("runuser -u alice -- pam-biometrics enroll")
+        output = machine.succeed("runuser -u alice -- pam-biometrics face enroll")
         assert "Enroll result: enroll-completed" in output, output
-        output = machine.succeed("pam-biometrics list alice")
+        output = machine.succeed("pam-biometrics face list alice")
         assert "Face for user alice on /dev/video10:" in output, output
         machine.succeed("stat -c %a /var/lib/private/pam-biometrics/alice.json | grep -x 600")
 
     with subtest("other users cannot scan for alice"):
-        output = machine.fail("runuser -u bob -- pam-biometrics scan alice")
+        output = machine.fail("runuser -u bob -- pam-biometrics face scan alice")
         assert "permission denied" in output, output
 
     with subtest("own face after a scan gives success"):
         show("${images.obama2}")
-        machine.succeed("pam-biometrics scan alice")
-        output = machine.succeed("pam-biometrics wait alice")
+        machine.succeed("pam-biometrics face scan alice")
+        output = machine.succeed("pam-biometrics face wait alice")
         assert output.strip() == "Face: recognized", output
         status, output, _ = authenticate("test-own")
         assert status == 0, output
         assert "Face recognized." in output, output
         assert "successfully authenticated" in output, output
         # The step consumed the result.
-        assert machine.succeed("pam-biometrics status alice").strip() == ""
+        assert machine.succeed("pam-biometrics face status alice").strip() == ""
 
     with subtest("verify mirrors fprintd-verify"):
-        output = machine.succeed("runuser -u alice -- pam-biometrics verify")
+        output = machine.succeed("runuser -u alice -- pam-biometrics face verify")
         assert "Verify result: verify-match (done)" in output, output
 
     with subtest("a stranger gives AUTH_ERR"):
         show("${images.biden-top}")
-        machine.succeed("pam-biometrics scan alice")
-        output = machine.succeed("pam-biometrics wait alice")
+        machine.succeed("pam-biometrics face scan alice")
+        output = machine.succeed("pam-biometrics face wait alice")
         assert output.strip() == "Face: not recognized", output
         status, output, _ = authenticate("test-own")
         assert status != 0, output
         assert "Face not recognized." in output, output
         assert "Not recognized." in output, output
         assert "Authentication failure" in output, output
-        machine.fail("runuser -u alice -- pam-biometrics verify")
+        machine.fail("runuser -u alice -- pam-biometrics face verify")
 
     with subtest("no scan gives success through PAM_IGNORE"):
         status, output, elapsed = authenticate("test-own")
@@ -173,13 +173,15 @@ testers.runNixOSTest {
             "> /tmp/rescan.log 2>&1; echo $? > /tmp/rescan.status'"
         )
         time.sleep(1)
-        machine.succeed("pam-biometrics scan alice")
-        machine.succeed("pam-biometrics wait alice")
+        machine.succeed("pam-biometrics face scan alice")
+        machine.succeed("pam-biometrics face wait alice")
         # The PAM step took the reject and keeps waiting.
-        machine.wait_until_succeeds('test -z "$(pam-biometrics status alice)"', timeout=10)
+        machine.wait_until_succeeds(
+            'test -z "$(pam-biometrics face status alice)"', timeout=10
+        )
         machine.fail("test -e /tmp/rescan.status")
         show("${images.obama2}")
-        machine.succeed("pam-biometrics scan alice")
+        machine.succeed("pam-biometrics face scan alice")
         machine.wait_for_file("/tmp/rescan.status", timeout=40)
         output = machine.succeed("cat /tmp/rescan.log")
         print(output)

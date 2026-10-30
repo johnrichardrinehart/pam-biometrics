@@ -32,7 +32,7 @@ The project has four parts:
 | `pam_biometrics.so`  | A small PAM module. It runs `pam-biometrics pam-helper`, shows the output lines of the helper as PAM messages, and maps the exit code to a PAM result. |
 | `policy.schema.json` | The JSON Schema of the policy file, in `share/pam-biometrics/`.                                                                                        |
 
-Face scans start on demand only. A key binding runs `pam-biometrics scan`.
+Face scans start on demand only. A key binding runs `pam-biometrics face scan`.
 The daemon scans for a few seconds and stores the result. The PAM step takes
 the result. The PAM step never turns on the camera.
 
@@ -203,37 +203,50 @@ square brackets keep the spaces in one argument.
 ## Key binding
 
 A key binding starts a face scan for the user that the binding runs as. The
-lock screen can show the state of the scan with `pam-biometrics status`.
+lock screen can show the state of the scan with
+`pam-biometrics face status`.
 
 An example for niri:
 
 ```kdl
 binds {
-    Mod+Alt+F allow-when-locked=true { spawn "pam-biometrics" "scan"; }
+    Mod+Alt+F allow-when-locked=true { spawn "pam-biometrics" "face" "scan"; }
 }
 ```
 
 A login greeter runs as the greeter user. Set `greeterUser` to that user. The
-greeter then runs `pam-biometrics scan USER` for the user that logs in.
+greeter then runs `pam-biometrics face scan USER` for the user that logs in.
 
 ## Command reference
 
-All commands accept `--socket PATH` (default `/run/pam-biometrics/socket`)
-and `--policy PATH` (default `/etc/pam-biometrics/policy.json`). `USER` is
-the current user if it is not given.
+The commands group by factor. All commands accept `--socket PATH` (default
+`/run/pam-biometrics/socket`) and `--policy PATH` (default
+`/etc/pam-biometrics/policy.json`).
 
-| Command                                                      | Function                                                                                                                                                                           |
-| ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `pam-biometrics enroll [USER] [--add]`                       | Records face samples. Without `--add`, it replaces the model. With `--add`, it adds samples and keeps the newest 30.                                                               |
-| `pam-biometrics verify [USER] [--json]`                      | Scans now and prints `Verify result: verify-match`, `verify-no-match`, or `verify-retry-scan`. Exits 0 only on a match. `--json` prints the daemon reply and its class.            |
-| `pam-biometrics delete USER...`                              | Deletes the face models.                                                                                                                                                           |
-| `pam-biometrics list USER...`                                | Shows the number of samples of each user.                                                                                                                                          |
-| `pam-biometrics scan [USER]`                                 | Starts a background scan. The next PAM step for the user uses the result.                                                                                                          |
-| `pam-biometrics status [USER] [--service S]`                 | Prints one line for a lock screen: `Face: scanning…`, `Face: recognized`, `Face: not sure`, `Face: not recognized`, `Face: no face found`, `Face: not enrolled`, or an empty line. |
-| `pam-biometrics wait [USER] [--service S]`                   | Waits for a running scan, then prints the same line as `status`.                                                                                                                   |
-| `pam-biometrics policy check [FILE]`                         | Validates a policy file. Exits 1 with a message if the file is missing or not valid.                                                                                               |
-| `pam-biometrics policy show [--service S] [--user U] [FILE]` | Prints the resolved settings as JSON.                                                                                                                                              |
-| `pam-biometrics pam-helper [--prompt TEXT]`                  | Decides the PAM step. `pam_biometrics.so` runs it.                                                                                                                                 |
+### Face commands
+
+The face commands talk to `pam-biometricsd`. `USER` is the current user if
+it is not given.
+
+| Command                                           | Function                                                                                                                                                                           |
+| ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pam-biometrics face enroll [USER] [--add]`       | Records face samples. Without `--add`, it replaces the model. With `--add`, it adds samples and keeps the newest 30.                                                               |
+| `pam-biometrics face verify [USER] [--json]`      | Scans now and prints `Verify result: verify-match`, `verify-no-match`, or `verify-retry-scan`. Exits 0 only on a match. `--json` prints the daemon reply and its class.            |
+| `pam-biometrics face delete USER...`              | Deletes the face models.                                                                                                                                                           |
+| `pam-biometrics face list USER...`                | Shows the number of samples of each user.                                                                                                                                          |
+| `pam-biometrics face scan [USER]`                 | Starts a background scan. The next PAM step for the user uses the result.                                                                                                          |
+| `pam-biometrics face status [USER] [--service S]` | Prints one line for a lock screen: `Face: scanning…`, `Face: recognized`, `Face: not sure`, `Face: not recognized`, `Face: no face found`, `Face: not enrolled`, or an empty line. |
+| `pam-biometrics face wait [USER] [--service S]`   | Waits for a running scan, then prints the same line as `status`.                                                                                                                   |
+
+### Other commands
+
+| Command                                                      | Function                                                                             |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------------ |
+| `pam-biometrics policy check [FILE]`                         | Validates a policy file. Exits 1 with a message if the file is missing or not valid. |
+| `pam-biometrics policy show [--service S] [--user U] [FILE]` | Prints the resolved settings as JSON.                                                |
+| `pam-biometrics pam-helper [--prompt TEXT]`                  | Decides the PAM step. `pam_biometrics.so` runs it.                                   |
+
+### Daemon flags
 
 The daemon has these flags:
 
@@ -354,12 +367,14 @@ service.
 
 ## Enrollment tips
 
-- Enroll in the light where you use the computer: `pam-biometrics enroll`.
-- Add samples for each other light condition: `pam-biometrics enroll --add`.
-  The model keeps the newest 30 samples. The match uses the closest sample.
+- Enroll in the light where you use the computer:
+  `pam-biometrics face enroll`.
+- Add samples for each other light condition:
+  `pam-biometrics face enroll --add`. The model keeps the newest 30
+  samples. The match uses the closest sample.
 - Enrollment needs exactly one face in at least 3 frames. It keeps at most
   10 samples per run, at even intervals.
-- `pam-biometrics verify --json` shows the best distance. The distance
+- `pam-biometrics face verify --json` shows the best distance. The distance
   between two photos of the same person is usually 0.15 to 0.45. The
   distance to other people is usually above 0.6.
 - A model file has the format

@@ -44,6 +44,13 @@ testers.runNixOSTest {
         pkgs.pamtester
       ];
 
+      # polkitd logs the registration of authentication agents at the info
+      # level.
+      systemd.services.polkit.serviceConfig.ExecStart = lib.mkForce [
+        ""
+        "${config.security.polkit.package.out}/lib/polkit-1/polkitd --log-level=info"
+      ];
+
       # Test only: alice can enroll her own face once the test creates the
       # flag file. Without the file, polkit has no agent to ask and refuses.
       security.polkit.extraConfig = ''
@@ -126,9 +133,18 @@ testers.runNixOSTest {
         return status, output, elapsed
 
 
+    def agent_registrations():
+        return int(
+            machine.succeed(
+                "journalctl -u polkit.service"
+                " | grep -c 'Registered Authentication Agent for unix-process' || true"
+            )
+        )
+
+
     with subtest("enrollment without polkit authorization fails"):
         show("${images.obama}")
-        # runuser with stdin from /dev/null has no polkit agent.
+        # Without a terminal, the command starts no polkit agent.
         output = machine.fail("runuser -u alice -- pam-biometrics face enroll < /dev/null")
         assert "Enroll result: enroll-failed (not authorized)" in output, output
         machine.fail("test -e /var/lib/private/pam-biometrics/alice.json")
@@ -138,6 +154,17 @@ testers.runNixOSTest {
         assert "Enroll result: enroll-failed (not authorized)" in output, output
         output = machine.fail("runuser -u bob -- pam-biometrics face list alice < /dev/null")
         assert "Failed for user alice: not authorized" in output, output
+        assert agent_registrations() == 0
+        # With a terminal, the command starts pkttyagent for its own process.
+        # polkit still refuses without a prompt, because the runuser session
+        # is not active.
+        output = machine.fail(
+            "script -qec 'runuser -u alice -- pam-biometrics face enroll' /dev/null"
+        )
+        assert "Enroll result: enroll-failed (not authorized)" in output, output
+        assert "cannot start" not in output, output
+        # polkitd writes each registration to syslog and to stdout.
+        assert agent_registrations() > 0
 
     with subtest("enroll from one photo with a polkit rule"):
         machine.succeed("touch /run/allow-alice-enroll")

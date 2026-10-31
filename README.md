@@ -276,11 +276,17 @@ The finger names are `left-thumb`, `left-index-finger`, `left-middle-finger`,
 `right-little-finger`. Without a reader, or without enrolled fingers, the
 commands print the reason and exit 1.
 
+fprintd asks polkit before `finger enroll` and `finger delete`. The default
+fprintd rule needs the password of the user for the own fingers.
+
 ### Authorization
 
 polkit needs an authentication agent to ask for a password. A desktop
-session often has one. Without an agent, polkit refuses, and the command
-prints `not authorized`. Root needs no password.
+session often has one. Without it, the commands that need authorization
+start `pkttyagent` for their own process when stdin is a terminal. polkit
+then asks for the password in the terminal. Without a terminal and without
+an agent, polkit refuses, and the command prints `not authorized`. Root
+needs no password.
 
 The face actions are in
 `share/polkit-1/actions/io.github.johnrichardrinehart.pam-biometrics.policy`:

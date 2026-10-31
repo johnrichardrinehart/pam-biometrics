@@ -7,6 +7,7 @@
   blas,
   lapack,
   linux-pam,
+  polkit,
   ffmpeg-headless,
   python3Packages,
   runCommand,
@@ -62,6 +63,8 @@ rustPlatform.buildRustPackage {
     PAM_BIOMETRICS_HELPER = "${placeholder "out"}/bin/pam-biometrics";
     # The daemon loads the dlib models from this directory.
     PAM_BIOMETRICS_MODEL_DIR = "${models}";
+    # The command line client asks for polkit passwords with this agent.
+    PAM_BIOMETRICS_PKTTYAGENT = lib.getExe' polkit "pkttyagent";
   };
 
   # checks.cargo-test runs the tests.

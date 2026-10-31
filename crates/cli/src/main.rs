@@ -3,6 +3,7 @@
 //! The commands group by factor. This program does not link dlib. The
 //! daemon does the face work.
 
+mod agent;
 mod face;
 mod face_commands;
 mod finger_commands;
@@ -18,6 +19,7 @@ use clap::{Parser, Subcommand};
 use pam_biometrics_policy::{DEFAULT_POLICY_PATH, Policy};
 use pam_biometrics_protocol::DEFAULT_SOCKET;
 
+use crate::agent::TtyAgent;
 use crate::face_commands::FaceCommand;
 use crate::finger_commands::FingerCommand;
 use crate::fprintd::SystemFprintd;
@@ -86,7 +88,8 @@ enum PolicyCommand {
     },
 }
 
-fn current_user() -> Result<String, String> {
+/// Returns the name of the user that runs this program.
+pub(crate) fn current_user() -> Result<String, String> {
     match nix::unistd::User::from_uid(nix::unistd::getuid()) {
         Ok(Some(user)) => Ok(user.name),
         _ => Err("cannot find the name of the current user".to_owned()),
@@ -138,6 +141,14 @@ fn finger(command: &FingerCommand) -> Result<u8, String> {
             return Ok(1);
         }
     };
+    // fprintd asks polkit before an enrollment or a deletion.
+    let changes = matches!(
+        command,
+        FingerCommand::Enroll { .. } | FingerCommand::Delete { .. }
+    );
+    let _agent = (changes && !nix::unistd::getuid().is_root())
+        .then(TtyAgent::start_for_terminal)
+        .flatten();
     Ok(finger_commands::run(
         command,
         &fprintd,

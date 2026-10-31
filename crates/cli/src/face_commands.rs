@@ -10,7 +10,8 @@ use clap::Subcommand;
 use pam_biometrics_policy::{FaceClass, FaceSettings};
 use pam_biometrics_protocol::{Op, Reply, Request, ScanResult, call};
 
-use crate::{load_policy, user_or_current};
+use crate::agent::TtyAgent;
+use crate::{current_user, load_policy, user_or_current};
 
 /// A face command.
 #[derive(Debug, Subcommand)]
@@ -70,6 +71,48 @@ const SHORT_TIMEOUT: Duration = Duration::from_secs(5);
 const WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(60);
 const ENROLL_TIMEOUT: Duration = Duration::from_secs(120);
+/// The extra time for a polkit authentication, for example a password.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// The daemon error when polkit refuses a request.
+const NOT_AUTHORIZED: &str = "not authorized";
+
+/// Returns true if the daemon asks polkit before it handles `op` for
+/// `user`. Root needs no authentication.
+fn needs_authorization(op: Op, user: &str) -> bool {
+    if nix::unistd::getuid().is_root() {
+        return false;
+    }
+    match op {
+        Op::Enroll | Op::Delete => true,
+        Op::Verify | Op::List => current_user().map_or(true, |current| current != user),
+        Op::Scan | Op::Status | Op::Wait | Op::Take => false,
+    }
+}
+
+/// Sends a request. If the request needs polkit, a terminal agent asks
+/// for the password while the request runs.
+fn authorized_request(
+    socket: &Path,
+    request: &Request,
+    timeout: Duration,
+) -> Result<Reply, String> {
+    if !needs_authorization(request.op, &request.user) {
+        return self::request(socket, request, timeout);
+    }
+    let agent = TtyAgent::start_for_terminal();
+    let reply = self::request(socket, request, timeout + AUTH_TIMEOUT);
+    drop(agent);
+    if let Ok(reply) = &reply
+        && reply.error.as_deref() == Some(NOT_AUTHORIZED)
+    {
+        eprintln!(
+            "pam-biometrics: polkit did not authorize this request. Run the command in a \
+             terminal to authenticate, or add a polkit rule for the action."
+        );
+    }
+    reply
+}
 
 /// Runs a face command against the daemon at `socket`. Returns the exit
 /// code.
@@ -131,7 +174,7 @@ fn enroll(socket: &Path, user: Option<String>, add: bool) -> Result<u8, String> 
     println!("Enrolling face. Look at the camera.");
     let mut enroll = Request::new(Op::Enroll, &user);
     enroll.add = add;
-    let reply = request(socket, &enroll, ENROLL_TIMEOUT)?;
+    let reply = authorized_request(socket, &enroll, ENROLL_TIMEOUT)?;
     if let Some(error) = &reply.error {
         println!("Enroll result: enroll-failed ({error})");
         return Ok(1);
@@ -147,7 +190,7 @@ fn enroll(socket: &Path, user: Option<String>, add: bool) -> Result<u8, String> 
 fn verify(socket: &Path, policy: &Path, user: Option<String>, json: bool) -> Result<u8, String> {
     let user = user_or_current(user)?;
     let face = load_policy(policy)?.resolve(None, Some(&user)).face;
-    let reply = request(socket, &Request::new(Op::Verify, &user), VERIFY_TIMEOUT)?;
+    let reply = authorized_request(socket, &Request::new(Op::Verify, &user), VERIFY_TIMEOUT)?;
     let class = match &reply.result {
         Some(ScanResult::Finished { best, faces }) => Some(face.classify(*best, *faces)),
         _ => None,
@@ -173,8 +216,8 @@ fn verify(socket: &Path, policy: &Path, user: Option<String>, json: bool) -> Res
 fn delete_or_list(socket: &Path, op: Op, users: &[String]) -> u8 {
     let mut status = 0;
     for user in users {
-        let reply =
-            request(socket, &Request::new(op, user), SHORT_TIMEOUT).unwrap_or_else(Reply::error);
+        let reply = authorized_request(socket, &Request::new(op, user), SHORT_TIMEOUT)
+            .unwrap_or_else(Reply::error);
         if let Some(error) = &reply.error {
             println!("Failed for user {user}: {error}");
             status = 1;

@@ -44,6 +44,22 @@ testers.runNixOSTest {
         pkgs.pamtester
       ];
 
+      # Test only: alice can enroll her own face once the test creates the
+      # flag file. Without the file, polkit has no agent to ask and refuses.
+      security.polkit.extraConfig = ''
+        polkit.addRule(function (action, subject) {
+          if (action.id == "io.github.johnrichardrinehart.pam-biometrics.face.enroll" &&
+              subject.user == "alice") {
+            try {
+              polkit.spawn(["/run/current-system/sw/bin/test", "-e", "/run/allow-alice-enroll"]);
+              return polkit.Result.YES;
+            } catch (error) {
+              return polkit.Result.NOT_HANDLED;
+            }
+          }
+        });
+      '';
+
       services.pam-biometrics = {
         enable = true;
         camera = {
@@ -110,13 +126,35 @@ testers.runNixOSTest {
         return status, output, elapsed
 
 
-    with subtest("enroll from one photo"):
+    with subtest("enrollment without polkit authorization fails"):
         show("${images.obama}")
+        # runuser with stdin from /dev/null has no polkit agent.
+        output = machine.fail("runuser -u alice -- pam-biometrics face enroll < /dev/null")
+        assert "Enroll result: enroll-failed (not authorized)" in output, output
+        machine.fail("test -e /var/lib/private/pam-biometrics/alice.json")
+        output = machine.fail(
+            "runuser -u bob -- pam-biometrics face enroll alice < /dev/null"
+        )
+        assert "Enroll result: enroll-failed (not authorized)" in output, output
+        output = machine.fail("runuser -u bob -- pam-biometrics face list alice < /dev/null")
+        assert "Failed for user alice: not authorized" in output, output
+
+    with subtest("enroll from one photo with a polkit rule"):
+        machine.succeed("touch /run/allow-alice-enroll")
         output = machine.succeed("runuser -u alice -- pam-biometrics face enroll")
         assert "Enroll result: enroll-completed" in output, output
         output = machine.succeed("pam-biometrics face list alice")
         assert "Face for user alice on /dev/video10:" in output, output
         machine.succeed("stat -c %a /var/lib/private/pam-biometrics/alice.json | grep -x 600")
+        # Without a rule, alice cannot delete her face.
+        output = machine.fail("runuser -u alice -- pam-biometrics face delete alice")
+        assert "Failed for user alice: not authorized" in output, output
+
+    with subtest("polkit authorizes root without a prompt"):
+        output = machine.succeed("pam-biometrics face enroll alice --add")
+        assert "Enroll result: enroll-completed (20 samples)" in output, output
+        output = machine.succeed("pam-biometrics face delete bob")
+        assert "No face to delete on /dev/video10" in output, output
 
     with subtest("other users cannot scan for alice"):
         output = machine.fail("runuser -u bob -- pam-biometrics face scan alice")

@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN" "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  Actions of pam-biometricsd. The daemon runs as the user pam-biometrics and
+  checks these actions for its clients. polkit lets only root and the owners
+  of an action check it for the processes of other users.
+-->
+<policyconfig>
+  <vendor>pam-biometrics</vendor>
+  <vendor_url>https://github.com/johnrichardrinehart/pam-biometrics</vendor_url>
+  <action id="io.github.johnrichardrinehart.pam-biometrics.face.enroll">
+    <description>Enroll your face</description>
+    <message>Authentication is necessary to enroll your face.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.owner">unix-user:pam-biometrics</annotate>
+  </action>
+  <action id="io.github.johnrichardrinehart.pam-biometrics.face.delete">
+    <description>Delete your face</description>
+    <message>Authentication is necessary to delete your face.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.owner">unix-user:pam-biometrics</annotate>
+  </action>
+  <action id="io.github.johnrichardrinehart.pam-biometrics.face.manage-other">
+    <description>Manage the face of another user</description>
+    <message>Authentication is necessary to enroll, delete, verify, or list the face of another user.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.owner">unix-user:pam-biometrics</annotate>
+  </action>
+</policyconfig>

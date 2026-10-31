@@ -5,6 +5,7 @@
 
 mod camera;
 mod model;
+mod polkit;
 mod scanner;
 mod service;
 
@@ -26,6 +27,7 @@ use pam_biometrics_policy::DEFAULT_POLICY_PATH;
 use pam_biometrics_protocol::{DEFAULT_SOCKET, MAX_REQUEST_BYTES, Reply, Request};
 
 use crate::camera::Camera;
+use crate::polkit::{Caller, SystemAuthority};
 use crate::scanner::{CameraScanner, Scanner};
 use crate::service::{Config, Service, SystemUsers, UserDb as _};
 
@@ -155,19 +157,24 @@ fn encode(width: usize, height: usize, model_dir: &Path, file: &Path) -> Result<
     Ok(())
 }
 
-fn peer_uid(stream: &UnixStream) -> nix::Result<u32> {
-    getsockopt(stream, PeerCredentials).map(|credentials| credentials.uid())
+/// Returns the peer credentials of a client connection.
+fn peer(stream: &UnixStream) -> Option<Caller> {
+    let credentials = getsockopt(stream, PeerCredentials).ok()?;
+    Some(Caller {
+        uid: credentials.uid(),
+        pid: u32::try_from(credentials.pid()).ok()?,
+    })
 }
 
 fn serve_connection<S: Scanner>(service: &Arc<Service<S>>, stream: &UnixStream) {
-    let Ok(uid) = peer_uid(stream) else {
+    let Some(caller) = peer(stream) else {
         return;
     };
     let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
     let mut line = String::new();
     let reply = match BufReader::new(stream.take(MAX_REQUEST_BYTES)).read_line(&mut line) {
         Ok(_) => match serde_json::from_str::<Request>(&line) {
-            Ok(request) => service.handle(uid, &request),
+            Ok(request) => service.handle(caller, &request),
             Err(_) => Reply::error("bad request"),
         },
         Err(_) => return,
@@ -229,7 +236,12 @@ fn run(args: DaemonArgs) -> Result<(), String> {
     fs::set_permissions(&args.socket, fs::Permissions::from_mode(0o666))
         .map_err(|error| format!("{}: {error}", args.socket.display()))?;
 
-    let service = Service::new(config, Box::new(SystemUsers), scanner);
+    let service = Service::new(
+        config,
+        Box::new(SystemUsers),
+        Box::new(SystemAuthority),
+        scanner,
+    );
     eprintln!("listening on {}", args.socket.display());
     for stream in listener.incoming() {
         match stream {

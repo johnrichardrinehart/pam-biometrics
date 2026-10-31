@@ -907,6 +907,7 @@ dependencies = [
  "pam-biometrics-protocol",
  "serde",
  "serde_json",
+ "zbus",
 ]
 
 [[package]]

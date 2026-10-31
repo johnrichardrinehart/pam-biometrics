@@ -121,7 +121,13 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    # The package also holds the polkit actions in share/polkit-1/actions.
+    # NixOS links share/polkit-1 of system packages into the directory
+    # that polkitd reads.
     environment.systemPackages = [ cfg.package ];
+
+    # The daemon asks polkit before face model changes.
+    security.polkit.enable = true;
 
     environment.etc."pam-biometrics/policy.json".source = policyFile;
 
@@ -161,6 +167,9 @@ in
           ]
         );
         DynamicUser = true;
+        # The polkit actions name this user as their owner, so that the
+        # daemon can check them for the processes of its clients.
+        User = "pam-biometrics";
         SupplementaryGroups = [ "video" ];
         StateDirectory = "pam-biometrics";
         StateDirectoryMode = "0700";

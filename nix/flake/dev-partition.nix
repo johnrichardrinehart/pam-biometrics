@@ -44,6 +44,7 @@
           shfmt.enable = true;
           statix.enable = true;
           taplo.enable = true;
+          xmllint.enable = true;
         };
         settings.formatter = {
           shellcheck.includes = [
@@ -54,6 +55,8 @@
             "*.sh"
             ".envrc"
           ];
+          # polkit action files are XML.
+          xmllint.includes = [ "*.policy" ];
         };
       };
 

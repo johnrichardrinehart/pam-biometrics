@@ -82,14 +82,28 @@ model files come from nixpkgs. A flake check compares the encodings with
 - An RGB camera has no liveness detection. A photo of the user can pass the
   face factor. Use the face factor as a convenience factor or together with
   the fingerprint (`"combine": "all"`), not as a strong factor alone.
-- The daemon runs as a dynamic user without network access. It can open
-  video devices only. The face models are in `/var/lib/pam-biometrics` with
-  mode 0600. The daemon saves no images.
+- The daemon runs as the dynamic user `pam-biometrics` without network
+  access. It can open video devices and the system bus only. The face
+  models are in `/var/lib/pam-biometrics` with mode 0600. The daemon saves
+  no images.
 - Every user can connect to the socket `/run/pam-biometrics/socket`. The
-  daemon reads the peer credentials of each connection. Root can use every
-  operation for every user. Other users can use every operation for
-  themselves. The greeter user can start scans for every user, and it has no
-  other access.
+  daemon reads the peer credentials of each connection and decides with
+  this table:
+
+  | Operation                          | Own face             | Face of another user                 | Root                      |
+  | ---------------------------------- | -------------------- | ------------------------------------ | ------------------------- |
+  | `enroll`                           | polkit `face.enroll` | polkit `face.manage-other`           | polkit, which allows root |
+  | `delete`                           | polkit `face.delete` | polkit `face.manage-other`           | polkit, which allows root |
+  | `verify`, `list`                   | allowed              | polkit `face.manage-other`           | allowed                   |
+  | `scan`                             | allowed              | refused, except for the greeter user | allowed                   |
+  | `status`, `wait`, PAM result reads | allowed              | refused                              | allowed                   |
+
+- polkit decides with the actions below and the polkit rules of the
+  system. The defaults need the password of the user for the own face, and
+  an administrator password for the face of another user. Both need an
+  active local session. polkit remembers a successful authentication for a
+  short time.
+- fprintd and its polkit rules decide the finger commands.
 - The PAM module runs the helper from a store path that the build sets. The
   helper gets an empty environment except `PAM_USER`, `PAM_SERVICE`, and
   `PAM_TYPE`.
@@ -238,6 +252,9 @@ it is not given.
 | `pam-biometrics face status [USER] [--service S]` | Prints one line for a lock screen: `Face: scanning…`, `Face: recognized`, `Face: not sure`, `Face: not recognized`, `Face: no face found`, `Face: not enrolled`, or an empty line. |
 | `pam-biometrics face wait [USER] [--service S]`   | Waits for a running scan, then prints the same line as `status`.                                                                                                                   |
 
+`enroll` and `delete` need polkit authorization. So do `verify` and `list`
+for the face of another user. See [Authorization](#authorization).
+
 ### Finger commands
 
 The finger commands talk to fprintd on the system bus. Their output and exit
@@ -258,6 +275,43 @@ The finger names are `left-thumb`, `left-index-finger`, `left-middle-finger`,
 `right-index-finger`, `right-middle-finger`, `right-ring-finger`, and
 `right-little-finger`. Without a reader, or without enrolled fingers, the
 commands print the reason and exit 1.
+
+### Authorization
+
+polkit needs an authentication agent to ask for a password. A desktop
+session often has one. Without an agent, polkit refuses, and the command
+prints `not authorized`. Root needs no password.
+
+The face actions are in
+`share/polkit-1/actions/io.github.johnrichardrinehart.pam-biometrics.policy`:
+
+| Action ID                                                        | Default for an active session | Covers                                                          |
+| ---------------------------------------------------------------- | ----------------------------- | --------------------------------------------------------------- |
+| `io.github.johnrichardrinehart.pam-biometrics.face.enroll`       | `auth_self_keep`              | `face enroll` and `face enroll --add` for the own face.         |
+| `io.github.johnrichardrinehart.pam-biometrics.face.delete`       | `auth_self_keep`              | `face delete` for the own face.                                 |
+| `io.github.johnrichardrinehart.pam-biometrics.face.manage-other` | `auth_admin_keep`             | `face enroll`, `delete`, `verify`, and `list` for another user. |
+
+Inactive and remote sessions get `no` for all three actions. A polkit rule
+can change that. For example, this rule lets the members of `wheel` enroll
+their own face without a password:
+
+```nix
+{
+  security.polkit.extraConfig = ''
+    polkit.addRule(function (action, subject) {
+      if (action.id == "io.github.johnrichardrinehart.pam-biometrics.face.enroll" &&
+          subject.isInGroup("wheel")) {
+        return polkit.Result.YES;
+      }
+    });
+  '';
+}
+```
+
+The daemon checks the actions for the client processes. polkit lets only
+root and the owners of an action do that, so the actions name the user
+`pam-biometrics` as their owner. The NixOS module runs the daemon as that
+user and turns on polkit.
 
 ### Other commands
 

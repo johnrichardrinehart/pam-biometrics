@@ -37,6 +37,7 @@ rustPlatform.buildRustPackage {
       (root + "/Cargo.toml")
       (root + "/Cargo.lock")
       (root + "/crates")
+      (root + "/data")
       (root + "/examples")
       (root + "/schema")
     ];
@@ -69,6 +70,8 @@ rustPlatform.buildRustPackage {
   postInstall = ''
     install -Dm0444 -t "$out/share/pam-biometrics" schema/policy.schema.json
     install -Dm0444 -t "$out/share/pam-biometrics/examples" examples/*.json
+    install -Dm0444 -t "$out/share/polkit-1/actions" \
+      data/io.github.johnrichardrinehart.pam-biometrics.policy
     install -Dm0444 "$out/lib/libpam_biometrics_module.so" "$out/lib/security/pam_biometrics.so"
     rm "$out/lib/libpam_biometrics_module.so"
     wrapProgram "$out/bin/pam-biometricsd" \

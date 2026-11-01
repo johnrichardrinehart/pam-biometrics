@@ -393,19 +393,13 @@ fn expected(
 ) -> Option<Outcome> {
     use Outcome::{Match, NoDecision, Reject};
     let pair = (fingerprint, face);
-    match combine {
-        Combine::Any => match pair {
-            (Some(Match), _) | (_, Some(Match)) => Some(Match),
-            (None, _) | (_, None) if !deadline_passed => None,
-            (Some(Reject), _) | (_, Some(Reject)) => Some(Reject),
-            _ => Some(NoDecision),
-        },
-        Combine::All => match pair {
-            (Some(Reject), _) | (_, Some(Reject)) => Some(Reject),
-            (Some(Match), Some(Match)) => Some(Match),
-            (None, _) | (_, None) if !deadline_passed => None,
-            _ => Some(NoDecision),
-        },
+    match (combine, pair) {
+        // A reject wins with either combination.
+        (_, (Some(Reject), _) | (_, Some(Reject))) => Some(Reject),
+        (Combine::Any, (Some(Match), _) | (_, Some(Match)))
+        | (Combine::All, (Some(Match), Some(Match))) => Some(Match),
+        (_, (None, _) | (_, None)) if !deadline_passed => None,
+        _ => Some(NoDecision),
     }
 }
 
@@ -446,21 +440,30 @@ fn any_first_match_wins_before_the_other_factor_ends() {
         decide(Combine::Any, OnNoDecision::Deny, P, M, false),
         Some((Outcome::Match, StepOutcome::Success))
     );
-    assert_eq!(
-        decide(Combine::Any, OnNoDecision::Allow, R, M, false),
-        Some((Outcome::Match, StepOutcome::Success))
-    );
 }
 
 #[test]
-fn any_reject_waits_for_a_possible_match() {
-    assert_eq!(decide(Combine::Any, OnNoDecision::Allow, R, P, false), None);
+fn a_reject_wins_over_a_match() {
+    for combine in [Combine::Any, Combine::All] {
+        assert_eq!(
+            decide(combine, OnNoDecision::Allow, R, M, false),
+            Some((Outcome::Reject, StepOutcome::Reject))
+        );
+        assert_eq!(
+            decide(combine, OnNoDecision::Allow, M, R, false),
+            Some((Outcome::Reject, StepOutcome::Reject))
+        );
+    }
+}
+
+#[test]
+fn any_reject_decides_at_once() {
     assert_eq!(
-        decide(Combine::Any, OnNoDecision::Allow, R, P, true),
+        decide(Combine::Any, OnNoDecision::Allow, R, P, false),
         Some((Outcome::Reject, StepOutcome::Reject))
     );
     assert_eq!(
-        decide(Combine::Any, OnNoDecision::Allow, R, N, false),
+        decide(Combine::Any, OnNoDecision::Allow, P, R, false),
         Some((Outcome::Reject, StepOutcome::Reject))
     );
 }

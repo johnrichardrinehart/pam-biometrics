@@ -233,22 +233,35 @@ impl<'a, F: FaceControl, W: Write> Session<'a, F, W> {
         Next::Handled
     }
 
+    /// Returns true once a factor rejected. The attempt then fails.
+    fn rejected(&self) -> bool {
+        self.finished
+            .values()
+            .any(|outcome| *outcome == Outcome::Reject)
+    }
+
     fn on_event(&mut self, event: Event) {
         match event {
             Event::Message(text) => self.info(&text),
             Event::Polled(factor) => {
                 self.polled.insert(factor);
             }
+            // A reject sticks for the whole session: no later result of
+            // any factor replaces it.
+            Event::Provisional(factor, Outcome::Reject)
+            | Event::Finished(factor, Outcome::Reject) => {
+                self.finished.insert(factor, Outcome::Reject);
+            }
             Event::Provisional(factor, outcome) => {
-                // With `combine: all`, a reject decides: no later outcome
-                // can make the step succeed.
-                if self.settings.combine == Combine::All && outcome == Outcome::Reject {
-                    self.finished.entry(factor).or_insert(outcome);
-                }
                 self.provisional.insert(factor, outcome);
             }
             Event::Finished(factor, outcome) => {
-                if outcome == Outcome::Match {
+                if self.finished.get(&factor) == Some(&Outcome::Reject) {
+                    return;
+                }
+                // After a reject, a match changes nothing, so it shows
+                // nothing.
+                if outcome == Outcome::Match && !self.rejected() {
                     self.info(recognized(factor));
                 }
                 self.finished.insert(factor, outcome);
@@ -697,17 +710,92 @@ mod tests {
     }
 
     #[test]
-    fn a_later_match_replaces_a_face_reject() {
-        let (code, _, _, _) = run(
+    fn a_face_reject_sticks() {
+        for combine in [Combine::Any, Combine::All] {
+            let policy = settings(combine, OnNoDecision::Allow);
+            // Reject, then no face.
+            let (code, lines, _, elapsed) = run(
+                &policy,
+                FakeFace::default(),
+                vec![
+                    (0, message("Face not recognized.")),
+                    (0, face(Outcome::Reject)),
+                    (0, message("No face found.")),
+                    (0, face(Outcome::NoDecision)),
+                    (0, command(Command::Finish)),
+                ],
+            );
+            assert_eq!(code, EXIT_REJECT, "{combine:?}");
+            assert_eq!(
+                lines,
+                [
+                    "info Face not recognized.",
+                    "info No face found.",
+                    "info Not recognized."
+                ]
+            );
+            assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+
+            // Reject, then a face match. The match shows nothing.
+            let (code, lines, _, _) = run(
+                &policy,
+                FakeFace::default(),
+                vec![
+                    (0, face(Outcome::Reject)),
+                    (0, face(Outcome::Match)),
+                    (0, command(Command::Finish)),
+                ],
+            );
+            assert_eq!(code, EXIT_REJECT, "{combine:?}");
+            assert_eq!(lines, ["info Not recognized."]);
+
+            // Reject, then a fingerprint match, and a could-match face.
+            let (code, _, _, _) = run(
+                &policy,
+                FakeFace::default(),
+                vec![
+                    (0, face(Outcome::Reject)),
+                    (0, fingerprint(Outcome::Match)),
+                    (0, face(Outcome::NoDecision)),
+                    (0, command(Command::Finish)),
+                ],
+            );
+            assert_eq!(code, EXIT_REJECT, "{combine:?}");
+        }
+    }
+
+    #[test]
+    fn a_wrong_finger_sticks() {
+        let (code, lines, _, _) = run(
             &allow(),
             FakeFace::default(),
             vec![
-                (0, face(Outcome::Reject)),
-                (0, fingerprint(Outcome::Match)),
+                (0, fingerprint(Outcome::Reject)),
+                (0, face(Outcome::Match)),
                 (0, command(Command::Finish)),
             ],
         );
-        assert_eq!(code, EXIT_SUCCESS);
+        assert_eq!(code, EXIT_REJECT);
+        assert_eq!(lines, ["info Not recognized."]);
+    }
+
+    #[test]
+    fn a_reject_after_a_match_fails() {
+        // A match before the password and a reject later in the session.
+        let (code, lines, _, _) = run(
+            &allow(),
+            FakeFace::default(),
+            vec![
+                (0, fingerprint(Outcome::Match)),
+                (0, face(Outcome::Reject)),
+                (0, command(Command::Finish)),
+            ],
+        );
+        assert_eq!(code, EXIT_REJECT);
+        assert_eq!(
+            lines,
+            ["info Fingerprint recognized.", "info Not recognized."]
+        );
     }
 
     #[test]

@@ -337,7 +337,7 @@ testers.runNixOSTest {
         assert "scan face" not in output, output
         assert elapsed < 5, elapsed
 
-    with subtest("key binding scans during the password prompt count"):
+    with subtest("a stranger before the password fails even after the own face"):
         show("${images.biden-top}")
         inner = shlex.join(
             ["converse", "test-rescan", "alice", PROMPT, "=/tmp/rescan-go", PASSWORD]
@@ -357,6 +357,7 @@ testers.runNixOSTest {
         machine.wait_until_succeeds(
             'test -z "$(pam-biometrics face status alice)"', timeout=10
         )
+        # The own face follows, also during the password prompt.
         show("${images.obama2}")
         machine.succeed("pam-biometrics face scan alice")
         machine.wait_until_succeeds(
@@ -367,10 +368,14 @@ testers.runNixOSTest {
         machine.wait_for_file("/tmp/rescan.status", timeout=40)
         output = machine.succeed("cat /tmp/rescan.log")
         print(output)
-        assert machine.succeed("cat /tmp/rescan.status").strip() == "0", output
+        # The reject sticks: finish fails at once, without the wait, and
+        # the later match changes nothing.
+        assert machine.succeed("cat /tmp/rescan.status").strip() == "1", output
         assert "Face not recognized." in output, output
-        assert "Face recognized." in output, output
-        assert "successfully authenticated" in output, output
+        assert "Not recognized." in output, output
+        assert "Face recognized." not in output, output
+        assert WAIT not in output, output
+        assert "Authentication failure" in output, output
         no_helper()
 
     with subtest("finger commands report a missing reader"):

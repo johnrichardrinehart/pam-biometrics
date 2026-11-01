@@ -63,8 +63,9 @@ impl Settings {
     ///
     /// `finished` holds the outcome of each enabled factor that ended.
     /// After the deadline, a factor without an outcome counts as
-    /// [`Outcome::NoDecision`]. The return value is `None` while the step
-    /// must wait for more outcomes.
+    /// [`Outcome::NoDecision`]. A reject of any factor decides at once and
+    /// wins over a match, with `any` as with `all`. The return value is
+    /// `None` while the step must wait for more outcomes.
     #[must_use]
     pub fn decide(
         &self,
@@ -89,15 +90,14 @@ impl Settings {
         let any = |wanted: Outcome| outcomes().any(|outcome| *outcome == wanted);
 
         let combined = match self.combine {
+            _ if any(Outcome::Reject) => Outcome::Reject,
             Combine::Any if any(Outcome::Match) => Outcome::Match,
-            Combine::All if any(Outcome::Reject) => Outcome::Reject,
             Combine::All
                 if all_finished && outcomes().all(|outcome| *outcome == Outcome::Match) =>
             {
                 Outcome::Match
             }
             _ if !(all_finished || deadline_passed) => return None,
-            Combine::Any if any(Outcome::Reject) => Outcome::Reject,
             _ => Outcome::NoDecision,
         };
         let outcome = match (combined, self.on_no_decision) {

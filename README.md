@@ -43,8 +43,10 @@ The password is always necessary. The biometric factors are optional, with
 these rules:
 
 - A wrong finger (`fingerprint.max_tries` times) or a face beyond
-  `face.reject_distance` fails the attempt, before, during, or after the
-  password.
+  `face.reject_distance` at any point of the attempt, before, during, or
+  after the password, fails the attempt. The reject sticks: a later match,
+  a scan without a face, or an uncertain face does not undo it, with
+  `"combine": "any"` as with `"combine": "all"`.
 - A missing finger or face costs time: `finish` waits `timeout_seconds` for
   one, then gives no decision. `on_no_decision` then applies: with `allow`,
   the password alone passes, with `deny`, the attempt fails.
@@ -64,10 +66,11 @@ One call of `pam_authenticate` runs these steps:
    `PAM_IGNORE`. Without the face factor, every response is the password.
 3. `pam_unix` checks the password with `try_first_pass`. A wrong password
    ends the attempt. `pam_end` then stops the helper.
-4. `finish` decides with the outcomes so far. A match or a reject decides
-   at once. Otherwise `finish` shows `wait_message` and waits until a match
-   or a reject, at most `timeout_seconds` from its start. Without a
-   decision, `on_no_decision` applies. `finish` never asks a question.
+4. `finish` decides with the outcomes so far. A reject decides at once and
+   wins over a match. A match without a reject also decides at once.
+   Otherwise `finish` shows `wait_message` and waits until a match or a
+   reject, at most `timeout_seconds` from its start. Without a decision,
+   `on_no_decision` applies. `finish` never asks a question.
 5. `finish` stops the helper.
 
 A user can thus give the finger or the face before the password, at the
@@ -106,8 +109,10 @@ The factors run like this:
 - The face factor takes the stored result of the user from the daemon. It
   asks again every 200 ms, and waits for a running scan. The helper
   consumes each result when it reads it. A result that nobody reads expires
-  after the result TTL. A match ends the face factor. Other results do not
-  end it, so the user can scan again. The last result counts.
+  after the result TTL. A match ends the face factor. A result between the
+  two thresholds, or without a face, does not end it, so the user can scan
+  again. A reject ends the attempt for good: the helper ignores later
+  results, also a match.
 
 Each factor ends with one of three outcomes:
 
@@ -602,19 +607,19 @@ is `Password: `. A custom `wait_message` appears as it is.
 ### Semantics
 
 `finish` decides with the outcomes so far: the ended factors and the last
-result of the face factor. It decides at once on a match or a reject, before
-or during the wait. At the end of the wait, a factor without an outcome
-counts as `no_decision`.
+result of the face factor that is not a reject. A reject of either factor
+sticks for the whole attempt and wins over a match. `finish` decides at
+once on a reject or a match, before or during the wait. At the end of the
+wait, a factor without an outcome counts as `no_decision`.
 
-| `combine` | Factor outcomes                        | Step outcome                                                                |
-| --------- | -------------------------------------- | --------------------------------------------------------------------------- |
-| `any`     | One factor gives `match`.              | `success` at once.                                                          |
-| `any`     | No `match`. One factor gives `reject`. | `reject` at once.                                                           |
-| `any`     | No `match` and no `reject`.            | The wait goes on. At its end, `no_decision`, then `on_no_decision` applies. |
-| `all`     | One factor gives `reject`.             | `reject` at once.                                                           |
-| `all`     | All factors give `match`.              | `success` at once.                                                          |
-| `all`     | A factor has no `match` yet.           | The wait goes on. At its end, `no_decision`, then `on_no_decision` applies. |
-| either    | `factors` is empty.                    | `no_decision` at once. `start` asks nothing. `on_no_decision` is ignored.   |
+| `combine` | Factor outcomes                           | Step outcome                                                                |
+| --------- | ----------------------------------------- | --------------------------------------------------------------------------- |
+| either    | One factor gave `reject` at any point.    | `reject` at once, also after a `match`.                                     |
+| `any`     | No `reject`. One factor gives `match`.    | `success` at once.                                                          |
+| `any`     | No `match` and no `reject`.               | The wait goes on. At its end, `no_decision`, then `on_no_decision` applies. |
+| `all`     | No `reject`. All factors give `match`.    | `success` at once.                                                          |
+| `all`     | No `reject`. A factor has no `match` yet. | The wait goes on. At its end, `no_decision`, then `on_no_decision` applies. |
+| either    | `factors` is empty.                       | `no_decision` at once. `start` asks nothing. `on_no_decision` is ignored.   |
 
 The face factor classifies the scan result with the resolved thresholds:
 

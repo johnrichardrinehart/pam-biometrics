@@ -12,5 +12,8 @@ repository.workspace = true
 name = "pam_biometrics_module"
 crate-type = ["cdylib"]
 
+[dependencies]
+libc.workspace = true
+
 [lints]
 workspace = true

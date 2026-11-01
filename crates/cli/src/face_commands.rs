@@ -44,7 +44,7 @@ pub enum FaceCommand {
         #[arg(required = true)]
         users: Vec<String>,
     },
-    /// Start a background scan for USER. The next PAM step uses the result.
+    /// Start a background scan for USER. The next or running PAM attempt uses the result.
     Scan {
         /// The user. The default is the current user.
         user: Option<String>,

@@ -10,7 +10,7 @@ mod finger_commands;
 mod fingerprint;
 mod fprintd;
 mod helper;
-mod step;
+mod session;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -57,15 +57,12 @@ enum Command {
         #[command(subcommand)]
         command: PolicyCommand,
     },
-    /// Decide the biometric factors for pam_biometrics.so.
+    /// Run the biometric factors for pam_biometrics.so from start to finish.
     ///
-    /// Reads PAM_USER, PAM_SERVICE, and PAM_TYPE from the environment. Exits
-    /// 0 on a match, 10 on a reject, and 20 without a decision.
-    PamHelper {
-        /// Text to show when the step starts. It replaces the policy prompt.
-        #[arg(long)]
-        prompt: Option<String>,
-    },
+    /// Reads PAM_USER, PAM_SERVICE, and PAM_TYPE from the environment, and
+    /// the commands of the PAM module from stdin. Exits 0 on a match, 10 on
+    /// a reject, and 20 without a decision.
+    PamSession,
 }
 
 #[derive(Debug, Subcommand)]
@@ -160,8 +157,8 @@ fn finger(command: &FingerCommand) -> Result<u8, String> {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match &cli.command {
-        Command::PamHelper { prompt } => {
-            let code = helper::run(&cli.policy, &cli.socket, prompt.as_deref());
+        Command::PamSession => {
+            let code = helper::run(&cli.policy, &cli.socket);
             return ExitCode::from(u8::try_from(code).unwrap_or(1));
         }
         Command::Face { command } => face_commands::run(command, &cli.socket, &cli.policy),
@@ -302,10 +299,10 @@ mod tests {
                 command: PolicyCommand::Show { .. }
             }
         ));
-        let cli = parse(&["pam-helper", "--prompt=Touch the reader."]).unwrap();
-        assert!(matches!(
-            &cli.command,
-            Command::PamHelper { prompt: Some(prompt) } if prompt == "Touch the reader."
-        ));
+        let cli = parse(&["pam-session", "--policy=/etc/other.json"]).unwrap();
+        assert!(matches!(cli.command, Command::PamSession));
+        assert_eq!(cli.policy, Path::new("/etc/other.json"));
+        assert!(parse(&["pam-helper"]).is_err());
+        assert!(parse(&["pam-session", "--prompt=Touch the reader."]).is_err());
     }
 }

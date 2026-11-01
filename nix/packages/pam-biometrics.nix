@@ -86,7 +86,7 @@ rustPlatform.buildRustPackage {
   };
 
   meta = {
-    description = "Fingerprint and face factors for PAM, after the password";
+    description = "Fingerprint and face factors for PAM, before or after the password";
     homepage = "https://github.com/johnrichardrinehart/pam-biometrics";
     license = with lib.licenses; [
       mit

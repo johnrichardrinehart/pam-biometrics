@@ -1,15 +1,26 @@
 //! The fingerprint factor through fprintd on the system D-Bus.
+//!
+//! The factor verifies until a match, a reject, or a stop. After a device
+//! error, a lost device, or a missing device, it starts again after a pause.
 
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
+use std::time::Duration;
 
 use pam_biometrics_policy::{Factor, Outcome};
 use zbus::blocking::{Connection, Proxy};
 use zbus::zvariant::OwnedObjectPath;
 
 use crate::fprintd::{DEVICE_INTERFACE, MANAGER_INTERFACE, MANAGER_PATH, SERVICE};
-use crate::step::{Event, FactorTask, Stop};
+use crate::session::{Event, FactorTask, Stop, pause};
+
+/// The first pause before a new verification after an error. It doubles
+/// up to [`MAX_BACKOFF`] while the errors repeat.
+const MIN_BACKOFF: Duration = Duration::from_secs(1);
+
+/// The longest pause before a new verification.
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 /// The message after a wrong finger when tries remain.
 pub const RETRY_MESSAGE: &str = "Fingerprint not recognized. Try again.";
@@ -123,10 +134,26 @@ impl FactorTask for FingerprintTask {
         let session = Shared::default();
         let shared = Arc::clone(&session);
         thread::spawn(move || {
-            let outcome =
-                verify(&shared, &self.user, self.max_tries, &events).unwrap_or(Outcome::NoDecision);
-            lock(&shared).release();
-            let _ = events.send(Event::Finished(Factor::Fingerprint, outcome));
+            // Wrong fingers count across restarts.
+            let mut tries = Tries::new(self.max_tries);
+            let mut backoff = MIN_BACKOFF;
+            loop {
+                let mut started = false;
+                let outcome = verify(&shared, &self.user, &mut tries, &mut started, &events)
+                    .unwrap_or(Outcome::NoDecision);
+                lock(&shared).release();
+                if outcome != Outcome::NoDecision {
+                    let _ = events.send(Event::Finished(Factor::Fingerprint, outcome));
+                    return;
+                }
+                if started {
+                    backoff = MIN_BACKOFF;
+                }
+                if !pause(backoff, || lock(&shared).stopped) {
+                    return;
+                }
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+            }
         });
         Box::new(FingerprintStop(session))
     }
@@ -147,10 +174,13 @@ fn start_verify(session: &Shared) -> zbus::Result<bool> {
     Ok(true)
 }
 
+/// Verifies once. Returns [`Outcome::NoDecision`] after a device error or
+/// a stop. Sets `started` when the verification started.
 fn verify(
     session: &Shared,
     user: &str,
-    max_tries: u32,
+    tries: &mut Tries,
+    started: &mut bool,
     events: &Sender<Event>,
 ) -> zbus::Result<Outcome> {
     let connection = Connection::system()?;
@@ -169,12 +199,12 @@ fn verify(
         guard.claimed = true;
     }
 
-    let mut tries = Tries::new(max_tries);
     // "any" accepts every enrolled finger. Without it, fprintd checks only
     // the first enrolled finger.
     if !start_verify(session)? {
         return Ok(Outcome::NoDecision);
     }
+    *started = true;
     for message in statuses.by_ref() {
         let (result, done): (String, bool) = message.body().deserialize()?;
         let action = tries.on_status(&result, done);

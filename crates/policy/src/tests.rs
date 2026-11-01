@@ -20,11 +20,13 @@ fn built_in_defaults() {
     assert_eq!(settings.combine, Combine::Any);
     assert_eq!(settings.on_no_decision, OnNoDecision::Allow);
     assert_eq!(settings.timeout_seconds, 15);
-    assert_eq!(settings.prompt, None);
+    assert_eq!(settings.password_prompt, None);
+    assert_eq!(settings.finish_prompt, None);
     assert_eq!(settings.fingerprint.max_tries, 3);
     assert!((settings.face.match_distance - 0.45).abs() < f64::EPSILON);
     assert!((settings.face.reject_distance - 0.6).abs() < f64::EPSILON);
     assert_eq!(settings.face.min_reject_frames, 3);
+    assert_eq!(settings.face.trigger, "");
 }
 
 #[test]
@@ -111,14 +113,34 @@ fn objects_merge() {
 }
 
 #[test]
-fn prompt_resolves() {
-    let policy =
-        parse(r#"{"version": 1, "services": {"greetd": {"prompt": "Press Super+Alt+F."}}}"#)
-            .unwrap();
-    assert_eq!(policy.resolve(Some("sudo"), None).prompt, None);
+fn prompts_and_trigger_resolve() {
+    let policy = parse(
+        r#"{
+          "version": 1,
+          "defaults": { "password_prompt": "Password or Enter: " },
+          "services": {
+            "greetd": { "finish_prompt": "Press Enter.", "face": { "trigger": "f" } }
+          },
+          "users": { "alice": { "services": { "greetd": { "face": { "trigger": "" } } } } }
+        }"#,
+    )
+    .unwrap();
+    let sudo = policy.resolve(Some("sudo"), None);
+    assert_eq!(sudo.password_prompt.as_deref(), Some("Password or Enter: "));
+    assert_eq!(sudo.finish_prompt, None);
+    assert_eq!(sudo.face.trigger, "");
+    let greetd = policy.resolve(Some("greetd"), Some("bob"));
     assert_eq!(
-        policy.resolve(Some("greetd"), None).prompt.as_deref(),
-        Some("Press Super+Alt+F.")
+        greetd.password_prompt.as_deref(),
+        Some("Password or Enter: ")
+    );
+    assert_eq!(greetd.finish_prompt.as_deref(), Some("Press Enter."));
+    assert_eq!(greetd.face.trigger, "f");
+    // The trigger merges like the other face fields.
+    assert!((greetd.face.match_distance - 0.45).abs() < f64::EPSILON);
+    assert_eq!(
+        policy.resolve(Some("greetd"), Some("alice")).face.trigger,
+        ""
     );
 }
 
@@ -134,6 +156,9 @@ fn unknown_fields_are_errors() {
         r#"{"version": 1, "defaults": {"factors": ["iris"]}}"#,
         r#"{"version": 1, "defaults": {"combine": "first"}}"#,
         r#"{"version": 1, "defaults": {"on_no_decision": "ignore"}}"#,
+        // `finish_prompt` replaced `prompt`.
+        r#"{"version": 1, "defaults": {"prompt": "Touch the reader."}}"#,
+        r#"{"version": 1, "defaults": {"face": {"trigger": null}}}"#,
     ] {
         assert!(
             matches!(parse(text), Err(Error::Parse { .. })),
@@ -175,8 +200,20 @@ fn layer_values_are_checked() {
             "test: services.sudo: timeout_seconds must be at least 1",
         ),
         (
-            r#"{"version": 1, "defaults": {"prompt": "  "}}"#,
-            "test: defaults: prompt must contain text",
+            r#"{"version": 1, "defaults": {"password_prompt": "  "}}"#,
+            "test: defaults: password_prompt must contain text",
+        ),
+        (
+            r#"{"version": 1, "services": {"sudo": {"finish_prompt": ""}}}"#,
+            "test: services.sudo: finish_prompt must contain text",
+        ),
+        (
+            r#"{"version": 1, "defaults": {"finish_prompt": "Touch\nthe reader: "}}"#,
+            "test: defaults: finish_prompt must not contain control characters",
+        ),
+        (
+            r#"{"version": 1, "defaults": {"face": {"trigger": "f\r"}}}"#,
+            "test: defaults: face.trigger must not contain control characters",
         ),
         (
             r#"{"version": 1, "users": {"alice": {"defaults": {"fingerprint": {"max_tries": 0}}}}}"#,
@@ -512,6 +549,7 @@ fn face_classification_boundaries() {
         match_distance: 0.4,
         reject_distance: 0.6,
         min_reject_frames: 3,
+        trigger: String::new(),
     };
     assert_eq!(face.classify(Some(0.0), 1), FaceClass::Match);
     assert_eq!(face.classify(Some(0.4), 1), FaceClass::Match);
@@ -535,6 +573,7 @@ fn equal_thresholds_have_no_uncertain_band() {
         match_distance: 0.5,
         reject_distance: 0.5,
         min_reject_frames: 1,
+        trigger: String::new(),
     };
     assert_eq!(face.classify(Some(0.5), 1), FaceClass::Match);
     assert_eq!(face.classify(Some(0.500_001), 1), FaceClass::Reject);

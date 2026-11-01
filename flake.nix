@@ -1,5 +1,5 @@
 {
-  description = "Fingerprint and face factors for PAM, after the password";
+  description = "Fingerprint and face factors for PAM, before or after the password";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";

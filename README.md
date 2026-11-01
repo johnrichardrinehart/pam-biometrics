@@ -1,12 +1,13 @@
 # pam-biometrics
 
-pam-biometrics adds a biometric step to a PAM stack. The step runs after the
-password module. It accepts a fingerprint through fprintd or a face from a
-webcam. A policy file sets the factors, how the step combines them, and the
-thresholds for each PAM service and user.
+pam-biometrics adds biometric steps around the password module of a PAM
+stack. The user gives a fingerprint through fprintd or a face from a webcam,
+before or after typing the password. A policy file sets the factors, how the
+steps combine them, the prompts, and the thresholds for each PAM service and
+user.
 
-The password stays necessary. The step can only add a check after the
-password or reject the attempt.
+The password stays necessary. `pam_unix` checks it. The biometric steps can
+only add a check to the password or reject the attempt.
 
 ## Contents
 
@@ -25,39 +26,75 @@ password or reject the attempt.
 
 The project has four parts:
 
-| Part                 | Function                                                                                                                                                    |
-| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `pam-biometricsd`    | A daemon that owns the camera and the face models. It scans faces on request and keeps the last result of each user.                                        |
-| `pam-biometrics`     | The command line client and the PAM helper. It enrolls faces and fingers, starts scans, and decides the PAM step. It does not link dlib, so it starts fast. |
-| `pam_biometrics.so`  | A small PAM module. It runs `pam-biometrics pam-helper`, shows the output lines of the helper as PAM messages, and maps the exit code to a PAM result.      |
-| `policy.schema.json` | The JSON Schema of the policy file, in `share/pam-biometrics/`.                                                                                             |
+| Part                 | Function                                                                                                                                                                                           |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pam-biometricsd`    | A daemon that owns the camera and the face models. It scans faces on request and keeps the last result of each user.                                                                               |
+| `pam-biometrics`     | The command line client and the PAM helper. It enrolls faces and fingers, starts scans, and runs the factors of one PAM attempt. It does not link dlib, so it starts fast.                         |
+| `pam_biometrics.so`  | A small PAM module with two modes. `start` runs `pam-biometrics pam-session` and asks for the password. `finish` lets the helper decide after the password and maps its exit code to a PAM result. |
+| `policy.schema.json` | The JSON Schema of the policy file, in `share/pam-biometrics/`.                                                                                                                                    |
 
-Face scans start on demand only. A key binding runs `pam-biometrics face scan`.
-The daemon scans for a few seconds and stores the result. The PAM step takes
-the result. The PAM step never turns on the camera.
+Face scans start on demand only. The camera turns on only on an explicit
+trigger: a key binding that runs `pam-biometrics face scan`, the face trigger
+as the response to a prompt of the module, or a command of the greeter. The
+daemon scans for a few seconds and stores the result. The helper takes the
+result.
 
-The PAM step runs the enabled factors in parallel until the policy decides
-or the timeout passes:
+### One attempt
+
+One call of `pam_authenticate` runs these steps:
+
+1. `start` starts the helper. The helper runs the enabled factors in the
+   background until `finish` or `pam_end`.
+2. `start` asks for the password with `password_prompt`. The face trigger as
+   the response starts a face scan. The trigger is Enter alone by default.
+   `start` then shows `Scanning face…` and asks again with another prompt.
+   Any other response becomes `PAM_AUTHTOK`, and `start` returns
+   `PAM_IGNORE`. Without the face factor, every response is the password.
+3. `pam_unix` checks the password with `try_first_pass`. A wrong password
+   ends the attempt. `pam_end` then stops the helper.
+4. `finish` decides with the outcomes so far:
+   - A match or a reject decides at once.
+   - Without a decision, `finish` asks with `finish_prompt` if the result
+     can still change: with `"on_no_decision": "deny"` or
+     `"combine": "all"`. A finger on the reader before the response counts.
+     The face trigger starts a face scan. `finish` then waits until the
+     policy decides or `timeout_seconds` pass. The fingerprint still counts
+     during the wait. Any other response gives no decision.
+   - With `"on_no_decision": "allow"` and `"combine": "any"`, `finish` asks
+     nothing. It waits only for a face scan that runs, at most
+     `timeout_seconds`.
+5. `finish` stops the helper.
+
+A user can thus give the finger or the face before the password, at the
+prompt of `start`, or after the password, at the prompt of `finish`.
+`start` and `finish` show the lines of the helper as information messages,
+for example `Fingerprint recognized.`, before each prompt and during the
+wait.
+
+The factors run like this:
 
 - The fingerprint factor claims the default fprintd device and verifies any
   enrolled finger. After a wrong finger, it starts a new verification until
-  `fingerprint.max_tries` wrong fingers.
-- The face factor asks the daemon for the stored result of the user every
-  200 ms. The step consumes each result when it reads it. A result that
-  nobody reads expires after the result TTL. A match ends the face factor
-  at once. Other results do not end it, so the user can scan again until
-  the timeout. At the timeout, the last result counts. With
-  `"combine": "all"`, a face reject ends the step at once.
+  `fingerprint.max_tries` wrong fingers. After a device error, a lost
+  device, or no device, it starts again after a pause. The pause is 1 s and
+  doubles up to 30 s while the errors repeat.
+- The face factor takes the stored result of the user from the daemon. It
+  asks again every 200 ms, and waits for a running scan. The helper
+  consumes each result when it reads it. A result that nobody reads expires
+  after the result TTL. A match ends the face factor. Other results do not
+  end it, so the user can scan again. The last result counts. A face scan
+  that the user starts at the prompt of `finish` ends the face factor with
+  its result.
 
 Each factor ends with one of three outcomes:
 
-| Outcome       | Fingerprint                                                              | Face                                                                                                                    |
-| ------------- | ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
-| `match`       | fprintd reports `verify-match`.                                          | The best distance is at or below `face.match_distance`.                                                                 |
-| `reject`      | fprintd reports `verify-no-match` `fingerprint.max_tries` times.         | Faces are in at least `face.min_reject_frames` frames, and the best distance is above `face.reject_distance`.           |
-| `no_decision` | No finger, no reader, no enrolled finger, a D-Bus error, or the timeout. | No scan, no face, dark frames, a best distance between the two thresholds, no enrolled face, no daemon, or the timeout. |
+| Outcome       | Fingerprint                                                                     | Face                                                                                                                    |
+| ------------- | ------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `match`       | fprintd reports `verify-match`.                                                 | The best distance is at or below `face.match_distance`.                                                                 |
+| `reject`      | fprintd reports `verify-no-match` `fingerprint.max_tries` times.                | Faces are in at least `face.min_reject_frames` frames, and the best distance is above `face.reject_distance`.           |
+| `no_decision` | No finger, no reader, no enrolled finger, or a D-Bus error, until the decision. | No scan, no face, dark frames, a best distance between the two thresholds, no enrolled face, no daemon, or the timeout. |
 
-The helper exit code gives the PAM result:
+The exit code of the helper after `finish` gives the PAM result:
 
 | Step outcome  | Exit code | PAM result     |
 | ------------- | --------- | -------------- |
@@ -65,7 +102,47 @@ The helper exit code gives the PAM result:
 | `reject`      | 10        | `PAM_AUTH_ERR` |
 | `no_decision` | 20        | `PAM_IGNORE`   |
 
-A crash of the helper also gives `PAM_IGNORE`.
+A crash of the helper also gives `PAM_IGNORE`. A helper that does not start
+lets `start` return `PAM_IGNORE` without a prompt. `pam_unix` then asks for
+the password itself.
+
+### Helper protocol
+
+The module and the helper exchange lines over a socket pair on the standard
+input and output of the helper. A line is a word, then a space and a text
+for some words. No text contains a line break. Each side ignores unknown
+lines. The password never goes to the helper.
+
+The helper sends its settings first:
+
+| Line            | Meaning                                                                         |
+| --------------- | ------------------------------------------------------------------------------- |
+| `off`           | No factor is enabled. The helper exits.                                         |
+| `prompt TEXT`   | The first password prompt.                                                      |
+| `reprompt TEXT` | The password prompt after a face trigger. It differs from `prompt`.             |
+| `trigger TEXT`  | The face trigger. An empty text is Enter alone. Absent without the face factor. |
+| `ready`         | The end of the settings. The factors run.                                       |
+
+Then the module sends commands:
+
+| Command          | Effect                                                         |
+| ---------------- | -------------------------------------------------------------- |
+| `scan`           | Start a face scan for the user.                                |
+| `state`          | The helper replies `state VERDICT FACE`.                       |
+| `finish`         | Decide the step, then exit with the exit code of the step.     |
+| `answer trigger` | The reply to `ask`: the response was the face trigger.         |
+| `answer other`   | The reply to `ask`: any other response.                        |
+| `stop`           | Stop the factors and exit. The end of the input does the same. |
+
+The helper sends these lines at any time:
+
+| Line                 | Meaning                                                                         |
+| -------------------- | ------------------------------------------------------------------------------- |
+| `info TEXT`          | A line for the user.                                                            |
+| `state VERDICT FACE` | `VERDICT` is `success`, `reject`, or `pending`. `FACE` is `scanning` or `idle`. |
+| `ask TEXT`           | `finish` needs a response to the prompt `TEXT`. The module sends `answer`.      |
+
+### Face engine
 
 The face engine uses dlib with the defaults of the `face_recognition` Python
 package: the HOG frontal face detector without upsampling, the 5-point shape
@@ -76,9 +153,17 @@ model files come from nixpkgs. A flake check compares the encodings with
 
 ## Security model
 
-- The password module comes first in the stack with the `requisite`
-  control, so a wrong password ends the attempt. The biometric step adds a
-  second check after the password. It does not replace the password.
+- `pam_unix` checks the password with the `requisite` control, so a wrong
+  password ends the attempt. `start` only reads the password and hands it to
+  `pam_unix` as `PAM_AUTHTOK`. `finish` adds a second check after the
+  password. The biometric steps do not replace the password.
+- The password stays in the PAM module. The helper never receives it. The
+  module compares a response with the face trigger, then zeroes it before
+  it frees it. Choose a trigger that is not a password: with the face
+  factor, `start` never takes the trigger as the password, except after 5
+  triggers in one attempt.
+- The camera turns on only on an explicit trigger: a key binding, the face
+  trigger at a prompt of the module, or a command of the greeter.
 - An RGB camera has no liveness detection. A photo of the user can pass the
   face factor. Use the face factor as a convenience factor or together with
   the fingerprint (`"combine": "all"`), not as a strong factor alone.
@@ -98,6 +183,10 @@ model files come from nixpkgs. A flake check compares the encodings with
   | `scan`                             | allowed              | refused, except for the greeter user | allowed                   |
   | `status`, `wait`, PAM result reads | allowed              | refused                              | allowed                   |
 
+  The helper runs as the caller of the PAM application: root for `login`,
+  `sudo`, greetd, and the polkit agent helper of `run0`, and the user for a
+  screen locker. Both may scan the face of the user that logs in.
+
 - polkit decides with the actions below and the polkit rules of the
   system. The defaults need the password of the user for the own face, and
   an administrator password for the face of another user. Both need an
@@ -106,7 +195,13 @@ model files come from nixpkgs. A flake check compares the encodings with
 - fprintd and its polkit rules decide the finger commands.
 - The PAM module runs the helper from a store path that the build sets. The
   helper gets an empty environment except `PAM_USER`, `PAM_SERVICE`, and
-  `PAM_TYPE`.
+  `PAM_TYPE`. A socket pair connects the module and the helper, so a helper
+  that ends cannot raise SIGPIPE in the application.
+- `pam_end` stops a helper that still runs, also after a wrong password or
+  an aborted conversation: the module sends `stop`, sends SIGTERM after 2 s,
+  sends SIGKILL after 0.5 s more, and reaps the helper. The helper releases
+  the fprintd device on `stop`. fprintd also releases the device of a client
+  that disconnects.
 
 ## Installation
 
@@ -153,8 +248,8 @@ Then configure the service in `configuration.nix`:
     };
     greeterUser = "greeter";
     policy = {
-      defaults.prompt = "Touch the fingerprint reader or press Super+Alt+F.";
       services.polkit-1.on_no_decision = "deny";
+      services.greetd.face.trigger = "f";
     };
   };
 }
@@ -162,29 +257,38 @@ Then configure the service in `configuration.nix`:
 
 The module has these options:
 
-| Option                                        | Default    | Description                                                             |
-| --------------------------------------------- | ---------- | ----------------------------------------------------------------------- |
-| `services.pam-biometrics.enable`              | `false`    | Runs the daemon, installs the commands, and writes the policy.          |
-| `services.pam-biometrics.package`             | this flake | The package.                                                            |
-| `services.pam-biometrics.camera.device`       |            | The V4L2 device of the camera.                                          |
-| `services.pam-biometrics.camera.inputFormat`  | `null`     | The V4L2 input format, for example `mjpeg`.                             |
-| `services.pam-biometrics.camera.width`        | `640`      | The frame width in pixels.                                              |
-| `services.pam-biometrics.camera.height`       | `360`      | The frame height in pixels.                                             |
-| `services.pam-biometrics.scanSeconds`         | `4`        | The duration of a scan.                                                 |
-| `services.pam-biometrics.enrollSeconds`       | `6`        | The duration of an enrollment.                                          |
-| `services.pam-biometrics.resultTtlSeconds`    | `120`      | The time after which an unused scan result expires.                     |
-| `services.pam-biometrics.greeterUser`         | `null`     | A user that can start scans for every user.                             |
-| `services.pam-biometrics.policy`              | `{ }`      | The policy. The module sets `version` to 1 and checks it at build time. |
-| `services.pam-biometrics.pamRule` (read-only) |            | The PAM line of the biometric step.                                     |
+| Option                                                | Default    | Description                                                             |
+| ----------------------------------------------------- | ---------- | ----------------------------------------------------------------------- |
+| `services.pam-biometrics.enable`                      | `false`    | Runs the daemon, installs the commands, and writes the policy.          |
+| `services.pam-biometrics.package`                     | this flake | The package.                                                            |
+| `services.pam-biometrics.camera.device`               |            | The V4L2 device of the camera.                                          |
+| `services.pam-biometrics.camera.inputFormat`          | `null`     | The V4L2 input format, for example `mjpeg`.                             |
+| `services.pam-biometrics.camera.width`                | `640`      | The frame width in pixels.                                              |
+| `services.pam-biometrics.camera.height`               | `360`      | The frame height in pixels.                                             |
+| `services.pam-biometrics.scanSeconds`                 | `4`        | The duration of a scan.                                                 |
+| `services.pam-biometrics.enrollSeconds`               | `6`        | The duration of an enrollment.                                          |
+| `services.pam-biometrics.resultTtlSeconds`            | `120`      | The time after which an unused scan result expires.                     |
+| `services.pam-biometrics.greeterUser`                 | `null`     | A user that can start scans for every user.                             |
+| `services.pam-biometrics.policy`                      | `{ }`      | The policy. The module sets `version` to 1 and checks it at build time. |
+| `services.pam-biometrics.pamRules.start` (read-only)  |            | The PAM line of the biometric step before the password module.          |
+| `services.pam-biometrics.pamRules.finish` (read-only) |            | The PAM line of the biometric step after the password module.           |
 
 ## PAM placement
 
-Put the step after the password module. The `pamRule` option contains the
-complete line:
+Put `start` before the password module and `finish` after it. The
+`pamRules.start` and `pamRules.finish` options contain the complete lines.
+Every PAM service that uses pam-biometrics has this auth stack:
 
 ```text
-auth [success=ok ignore=ignore default=die] /nix/store/…-pam-biometrics-0.1.0/lib/security/pam_biometrics.so
+auth [success=ok ignore=ignore default=die] /nix/store/…-pam-biometrics-0.1.0/lib/security/pam_biometrics.so start
+auth requisite pam_unix.so nullok try_first_pass
+auth [success=ok ignore=ignore default=die] /nix/store/…-pam-biometrics-0.1.0/lib/security/pam_biometrics.so finish
+auth optional pam_gnome_keyring.so
 ```
+
+The last line is optional. `pam_unix` needs `try_first_pass`: it takes the
+password from `start`, and asks for the password itself when `start` sets
+none, for example without an enabled factor.
 
 For example, for a screen locker:
 
@@ -194,8 +298,9 @@ For example, for a screen locker:
   security.pam.services.hyprlock.text = ''
     account required pam_unix.so
 
-    auth requisite pam_unix.so nullok
-    ${config.services.pam-biometrics.pamRule}
+    ${config.services.pam-biometrics.pamRules.start}
+    auth requisite pam_unix.so nullok try_first_pass
+    ${config.services.pam-biometrics.pamRules.finish}
     auth required pam_permit.so
 
     password required pam_unix.so
@@ -207,17 +312,33 @@ For example, for a screen locker:
 The control values have this effect:
 
 - `success=ok`: a match lets the stack continue.
-- `ignore=ignore`: without a decision, the other modules decide.
-- `default=die`: a reject ends the attempt with a failure.
+- `ignore=ignore`: without a decision, the other modules decide. `start`
+  always gives `PAM_IGNORE` after the password.
+- `default=die`: a reject ends the attempt with a failure. So does an
+  aborted conversation, which gives `PAM_CONV_ERR`.
 
-The module passes its arguments to `pam-biometrics pam-helper`. For example,
-`[--prompt=Touch the reader.]` sets the prompt for one PAM service. The
-square brackets keep the spaces in one argument.
+The first module argument selects the mode, `start` or `finish`. Without
+one of them, the module runs `finish`, so one line after the password
+module is a complete after-password step. The module passes the other
+arguments to `pam-biometrics pam-session`, for example
+`--policy=/etc/pam-biometrics/other.json`.
+
+The applications differ in how they show the prompts:
+
+- The second prompt of `start` differs from the first one, and the prompts
+  alternate after more triggers. An application that answers a repeated
+  prompt with the last response thus cannot start scans in a loop. After 5
+  triggers in one attempt, every response is the password.
+- `sudo` shows its own `[sudo] password for USER:` prompt instead of the
+  PAM prompt `Password: `. It shows the other prompts as they are.
+- A greeter or a screen locker can show the information messages in its own
+  way, or not at all.
 
 ## Key binding
 
 A key binding starts a face scan for the user that the binding runs as. The
-lock screen can show the state of the scan with
+helper takes the result during the password prompt or the wait of
+`finish`. The lock screen can show the state of the scan with
 `pam-biometrics face status`.
 
 An example for niri:
@@ -228,8 +349,14 @@ binds {
 }
 ```
 
+The face trigger at a prompt of the module also starts a scan. It needs no
+key binding. The trigger is Enter alone by default. `face.trigger` sets
+another text.
+
 A login greeter runs as the greeter user. Set `greeterUser` to that user. The
 greeter then runs `pam-biometrics face scan USER` for the user that logs in.
+greetd runs the PAM stack as root, so the face trigger works there without
+`greeterUser`.
 
 ## Command reference
 
@@ -248,7 +375,7 @@ it is not given.
 | `pam-biometrics face verify [USER] [--json]`      | Scans now and prints `Verify result: verify-match`, `verify-no-match`, or `verify-retry-scan`. Exits 0 only on a match. `--json` prints the daemon reply and its class.            |
 | `pam-biometrics face delete USER...`              | Deletes the face models.                                                                                                                                                           |
 | `pam-biometrics face list USER...`                | Shows the number of samples of each user.                                                                                                                                          |
-| `pam-biometrics face scan [USER]`                 | Starts a background scan. The next PAM step for the user uses the result.                                                                                                          |
+| `pam-biometrics face scan [USER]`                 | Starts a background scan. The next or running PAM attempt for the user uses the result.                                                                                            |
 | `pam-biometrics face status [USER] [--service S]` | Prints one line for a lock screen: `Face: scanning…`, `Face: recognized`, `Face: not sure`, `Face: not recognized`, `Face: no face found`, `Face: not enrolled`, or an empty line. |
 | `pam-biometrics face wait [USER] [--service S]`   | Waits for a running scan, then prints the same line as `status`.                                                                                                                   |
 
@@ -325,7 +452,7 @@ user and turns on polkit.
 | ------------------------------------------------------------ | ------------------------------------------------------------------------------------ |
 | `pam-biometrics policy check [FILE]`                         | Validates a policy file. Exits 1 with a message if the file is missing or not valid. |
 | `pam-biometrics policy show [--service S] [--user U] [FILE]` | Prints the resolved settings as JSON.                                                |
-| `pam-biometrics pam-helper [--prompt TEXT]`                  | Decides the PAM step. `pam_biometrics.so` runs it.                                   |
+| `pam-biometrics pam-session`                                 | Runs the factors of one PAM attempt. `pam_biometrics.so` runs it.                    |
 
 ### Daemon flags
 
@@ -373,12 +500,13 @@ built-in defaults apply. Unknown fields are errors. The schema is
     "face": {
       "match_distance": 0.45,
       "reject_distance": 0.6,
-      "min_reject_frames": 3
+      "min_reject_frames": 3,
+      "trigger": ""
     }
   },
   "services": {
     "sudo": { "factors": ["fingerprint", "face"] },
-    "greetd": { "timeout_seconds": 20 }
+    "greetd": { "timeout_seconds": 20, "face": { "trigger": "f" } }
   },
   "users": {
     "john": {
@@ -405,33 +533,54 @@ Lists replace the list of the earlier layer. Objects merge field by field.
 
 ### Fields
 
-| Field                    | Type                          | Default                   | Meaning                                                                                      |
-| ------------------------ | ----------------------------- | ------------------------- | -------------------------------------------------------------------------------------------- |
-| `factors`                | list of `fingerprint`, `face` | `["fingerprint", "face"]` | The enabled factors. An empty list gives `no_decision` at once and ignores `on_no_decision`. |
-| `combine`                | `any` or `all`                | `any`                     | How the step combines the factor outcomes.                                                   |
-| `on_no_decision`         | `allow` or `deny`             | `allow`                   | `allow` gives `PAM_IGNORE`. `deny` gives `PAM_AUTH_ERR`.                                     |
-| `timeout_seconds`        | integer, 1 or more            | `15`                      | The maximum wait for the factors.                                                            |
-| `prompt`                 | text                          | depends on the factors    | The first line that the step shows. `--prompt` of the helper overrides it.                   |
-| `fingerprint.max_tries`  | integer, 1 or more            | `3`                       | Wrong fingers before a reject.                                                               |
-| `face.match_distance`    | number above 0                | `0.45`                    | A best distance at or below this value is a match.                                           |
-| `face.reject_distance`   | number above 0                | `0.6`                     | A best distance above this value can reject. It must not be below `match_distance`.          |
-| `face.min_reject_frames` | integer, 1 or more            | `3`                       | A reject needs a face in this many frames.                                                   |
+| Field                    | Type                          | Default                   | Meaning                                                                                        |
+| ------------------------ | ----------------------------- | ------------------------- | ---------------------------------------------------------------------------------------------- |
+| `factors`                | list of `fingerprint`, `face` | `["fingerprint", "face"]` | The enabled factors. An empty list gives `no_decision` at once and ignores `on_no_decision`.   |
+| `combine`                | `any` or `all`                | `any`                     | How the steps combine the factor outcomes.                                                     |
+| `on_no_decision`         | `allow` or `deny`             | `allow`                   | `allow` gives `PAM_IGNORE`. `deny` gives `PAM_AUTH_ERR`.                                       |
+| `timeout_seconds`        | integer, 1 or more            | `15`                      | The maximum wait of `finish` for the factors after the password.                               |
+| `password_prompt`        | one line of text              | depends on the factors    | The first password prompt of `start`.                                                          |
+| `finish_prompt`          | one line of text              | depends on the factors    | The prompt of `finish` after the password.                                                     |
+| `fingerprint.max_tries`  | integer, 1 or more            | `3`                       | Wrong fingers before a reject.                                                                 |
+| `face.match_distance`    | number above 0                | `0.45`                    | A best distance at or below this value is a match.                                             |
+| `face.reject_distance`   | number above 0                | `0.6`                     | A best distance above this value can reject. It must not be below `match_distance`.            |
+| `face.min_reject_frames` | integer, 1 or more            | `3`                       | A reject needs a face in this many frames.                                                     |
+| `face.trigger`           | one line of text              | `""`                      | The response to a prompt of the module that starts a face scan. The empty text is Enter alone. |
 
-The default prompt is `Touch the fingerprint reader or scan your face.` with
-both factors, `Touch the fingerprint reader.` with the fingerprint only, and
-`Scan your face.` with the face only.
+The prompts and the trigger cannot contain line breaks or other control
+characters. Without the face factor, the trigger means nothing.
+
+The default prompts depend on the factors and on `face.trigger`. `TRIGGER`
+stands for `press Enter` with the empty trigger, and for `type f` with the
+trigger `f`:
+
+| Factors          | `password_prompt`                 | `finish_prompt`                                                |
+| ---------------- | --------------------------------- | -------------------------------------------------------------- |
+| both, `any`      | `Password (Enter to scan face): ` | `Touch the fingerprint reader, or TRIGGER to scan your face: ` |
+| both, `all`      | `Password (Enter to scan face): ` | `Touch the fingerprint reader and TRIGGER to scan your face: ` |
+| fingerprint only | `Password: `                      | `Touch the fingerprint reader, then press Enter: `             |
+| face only        | `Password (Enter to scan face): ` | `TRIGGER to scan your face: `, with a capital letter           |
+
+With a non-empty trigger, the default password prompt is
+`Password (type f to scan face): `. After a trigger, `start` asks with
+`Password: `, or with `Password (face scan started): ` if the first prompt
+is `Password: `.
 
 ### Semantics
 
-| `combine` | Factor outcomes                                     | Step outcome                                        |
-| --------- | --------------------------------------------------- | --------------------------------------------------- |
-| `any`     | One factor gives `match`.                           | `success` at once.                                  |
-| `any`     | No `match`. One factor gives `reject`.              | `reject` after all factors end or the timeout.      |
-| `any`     | No `match` and no `reject`.                         | `no_decision`, then `on_no_decision` applies.       |
-| `all`     | One factor gives `reject`.                          | `reject` at once.                                   |
-| `all`     | All factors give `match`.                           | `success`.                                          |
-| `all`     | A factor gives `no_decision` or the timeout passes. | `no_decision`, then `on_no_decision` applies.       |
-| either    | `factors` is empty.                                 | `no_decision` at once. `on_no_decision` is ignored. |
+`finish` decides with the outcomes so far: the ended factors and the last
+result of the face factor. A factor without an outcome counts as
+`no_decision`.
+
+| `combine` | Factor outcomes                                     | Step outcome                                                                 |
+| --------- | --------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `any`     | One factor gives `match`.                           | `success`.                                                                   |
+| `any`     | No `match`. One factor gives `reject`.              | `reject`. During the wait of `finish`, after all factors end or the timeout. |
+| `any`     | No `match` and no `reject`.                         | `no_decision`, then `on_no_decision` applies.                                |
+| `all`     | One factor gives `reject`.                          | `reject` at once.                                                            |
+| `all`     | All factors give `match`.                           | `success`.                                                                   |
+| `all`     | A factor gives `no_decision` or the timeout passes. | `no_decision`, then `on_no_decision` applies.                                |
+| either    | `factors` is empty.                                 | `no_decision` at once. `start` asks nothing. `on_no_decision` is ignored.    |
 
 The face factor classifies the scan result with the resolved thresholds:
 
@@ -472,13 +621,13 @@ nix flake check --print-build-logs  # run all checks
 
 The checks are:
 
-| Check             | Content                                                                                               |
-| ----------------- | ----------------------------------------------------------------------------------------------------- |
-| `cargo-test`      | The unit tests of all crates. Mock factors cover the fingerprint paths.                               |
-| `clippy`          | `cargo clippy --all-targets -- --deny warnings`.                                                      |
-| `encoding-parity` | The encodings of the daemon and of `face_recognition` for the same pixels agree within 1e-3.          |
-| `vm`              | A NixOS VM with a v4l2loopback camera that shows still photos. It drives PAM services with pamtester. |
-| `pre-commit`      | treefmt and the Git hooks.                                                                            |
+| Check             | Content                                                                                                                                                      |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `cargo-test`      | The unit tests of all crates. Mock factors cover the fingerprint paths and the session decisions. Shell scripts stand in for the helper in the module tests. |
+| `clippy`          | `cargo clippy --all-targets -- --deny warnings`.                                                                                                             |
+| `encoding-parity` | The encodings of the daemon and of `face_recognition` for the same pixels agree within 1e-3.                                                                 |
+| `vm`              | A NixOS VM with a v4l2loopback camera that shows still photos. It drives `start`, `pam_unix`, and `finish` with pamtester in a terminal.                     |
+| `pre-commit`      | treefmt and the Git hooks.                                                                                                                                   |
 
 ## License
 

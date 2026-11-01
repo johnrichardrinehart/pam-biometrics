@@ -9,12 +9,13 @@
     "face": {
       "match_distance": 0.45,
       "reject_distance": 0.6,
-      "min_reject_frames": 3
+      "min_reject_frames": 3,
+      "trigger": ""
     }
   },
   "services": {
     "sudo": { "factors": ["fingerprint", "face"] },
-    "greetd": { "timeout_seconds": 20 }
+    "greetd": { "timeout_seconds": 20, "face": { "trigger": "f" } }
   },
   "users": {
     "john": {

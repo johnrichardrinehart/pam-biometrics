@@ -234,10 +234,16 @@ fn check_layer(layer: &Layer) -> Result<(), String> {
     if layer.timeout_seconds == Some(0) {
         return Err("timeout_seconds must be at least 1".to_owned());
     }
-    if let Some(prompt) = &layer.prompt
-        && prompt.trim().is_empty()
-    {
-        return Err("prompt must contain text".to_owned());
+    for (name, prompt) in [
+        ("password_prompt", &layer.password_prompt),
+        ("finish_prompt", &layer.finish_prompt),
+    ] {
+        if let Some(prompt) = prompt {
+            if prompt.trim().is_empty() {
+                return Err(format!("{name} must contain text"));
+            }
+            check_line(name, prompt)?;
+        }
     }
     if let Some(fingerprint) = &layer.fingerprint
         && fingerprint.max_tries == Some(0)
@@ -258,6 +264,18 @@ fn check_layer(layer: &Layer) -> Result<(), String> {
         if face.min_reject_frames == Some(0) {
             return Err("face.min_reject_frames must be at least 1".to_owned());
         }
+        if let Some(trigger) = &face.trigger {
+            check_line("face.trigger", trigger)?;
+        }
+    }
+    Ok(())
+}
+
+/// The PAM module and the helper exchange these texts as lines, so they
+/// cannot contain line breaks or other control characters.
+fn check_line(name: &str, text: &str) -> Result<(), String> {
+    if text.chars().any(char::is_control) {
+        return Err(format!("{name} must not contain control characters"));
     }
     Ok(())
 }

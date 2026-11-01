@@ -71,6 +71,10 @@ pub struct FaceSettings {
     pub reject_distance: f64,
     /// A reject needs a face in at least this many frames.
     pub min_reject_frames: u32,
+    /// The response to a password prompt that starts a face scan. The empty
+    /// text stands for an empty response, that is Enter alone.
+    #[serde(default)]
+    pub trigger: String,
 }
 
 /// Settings for one (service, user) pair after the resolution of all layers.
@@ -83,11 +87,17 @@ pub struct Settings {
     pub combine: Combine,
     /// What the step does without a decision.
     pub on_no_decision: OnNoDecision,
-    /// Maximum time that the step waits for the factors.
+    /// Maximum time that the step waits for the factors after the
+    /// password.
     pub timeout_seconds: u32,
-    /// Text that the step shows when it starts to wait.
+    /// The first password prompt of `start`. `None` gives a text that
+    /// depends on the factors and the face trigger.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt: Option<String>,
+    pub password_prompt: Option<String>,
+    /// The prompt of `finish` after the password. `None` gives a text that
+    /// depends on the factors and the face trigger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_prompt: Option<String>,
     /// Fingerprint settings.
     pub fingerprint: FingerprintSettings,
     /// Face settings.
@@ -101,12 +111,14 @@ impl Default for Settings {
             combine: Combine::Any,
             on_no_decision: OnNoDecision::Allow,
             timeout_seconds: 15,
-            prompt: None,
+            password_prompt: None,
+            finish_prompt: None,
             fingerprint: FingerprintSettings { max_tries: 3 },
             face: FaceSettings {
                 match_distance: 0.45,
                 reject_distance: 0.6,
                 min_reject_frames: 3,
+                trigger: String::new(),
             },
         }
     }
@@ -127,8 +139,11 @@ impl Settings {
         if let Some(timeout) = layer.timeout_seconds {
             self.timeout_seconds = timeout;
         }
-        if let Some(prompt) = &layer.prompt {
-            self.prompt = Some(prompt.clone());
+        if let Some(prompt) = &layer.password_prompt {
+            self.password_prompt = Some(prompt.clone());
+        }
+        if let Some(prompt) = &layer.finish_prompt {
+            self.finish_prompt = Some(prompt.clone());
         }
         if let Some(fingerprint) = &layer.fingerprint
             && let Some(max_tries) = fingerprint.max_tries
@@ -144,6 +159,9 @@ impl Settings {
             }
             if let Some(frames) = face.min_reject_frames {
                 self.face.min_reject_frames = frames;
+            }
+            if let Some(trigger) = &face.trigger {
+                self.face.trigger.clone_from(trigger);
             }
         }
     }
@@ -197,13 +215,20 @@ pub struct Layer {
         skip_serializing_if = "Option::is_none"
     )]
     pub timeout_seconds: Option<u32>,
-    /// See [`Settings::prompt`].
+    /// See [`Settings::password_prompt`].
     #[serde(
         default,
         deserialize_with = "present",
         skip_serializing_if = "Option::is_none"
     )]
-    pub prompt: Option<String>,
+    pub password_prompt: Option<String>,
+    /// See [`Settings::finish_prompt`].
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub finish_prompt: Option<String>,
     /// See [`Settings::fingerprint`].
     #[serde(
         default,
@@ -258,4 +283,11 @@ pub struct FaceLayer {
         skip_serializing_if = "Option::is_none"
     )]
     pub min_reject_frames: Option<u32>,
+    /// See [`FaceSettings::trigger`].
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub trigger: Option<String>,
 }

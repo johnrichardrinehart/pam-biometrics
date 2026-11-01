@@ -3,7 +3,7 @@
   "defaults": {
     "combine": "all",
     "on_no_decision": "deny",
-    "prompt": "Touch the fingerprint reader and press Super+Alt+F."
+    "finish_prompt": "Touch the fingerprint reader, then press Enter to scan your face: "
   },
   "services": {
     "login": { "factors": [] },

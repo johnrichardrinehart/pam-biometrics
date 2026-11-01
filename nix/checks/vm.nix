@@ -1,5 +1,5 @@
 # Runs the daemon on a v4l2loopback camera that shows still photos, and
-# drives PAM services that use the pam-biometrics step.
+# drives PAM stacks with the start and finish steps through a terminal.
 {
   images,
   nixosModules,
@@ -32,7 +32,10 @@ testers.runNixOSTest {
       };
 
       users.users = {
-        alice.isNormalUser = true;
+        alice = {
+          isNormalUser = true;
+          password = "alice-password";
+        };
         bob.isNormalUser = true;
       };
 
@@ -42,6 +45,9 @@ testers.runNixOSTest {
       environment.systemPackages = [
         pkgs.ffmpeg-headless
         pkgs.pamtester
+        (pkgs.writers.writePython3Bin "converse" {
+          libraries = [ pkgs.python3Packages.pexpect ];
+        } (builtins.readFile ./converse.py))
       ];
 
       # polkitd logs the registration of authentication agents at the info
@@ -77,38 +83,57 @@ testers.runNixOSTest {
         scanSeconds = 6;
         enrollSeconds = 10;
         policy = {
-          defaults.timeout_seconds = 5;
+          defaults.timeout_seconds = 15;
           services = {
             test-deny.on_no_decision = "deny";
             test-none.factors = [ ];
+            test-trigger.face.trigger = "f";
             test-rescan.timeout_seconds = 40;
           };
         };
       };
 
       security.pam.services =
+        let
+          inherit (config.services.pam-biometrics) pamRules;
+        in
         lib.genAttrs
           [
             "test-own"
             "test-deny"
             "test-none"
+            "test-trigger"
             "test-rescan"
           ]
           (_: {
             text = ''
-              auth requisite pam_permit.so
-              ${config.services.pam-biometrics.pamRule}
+              ${pamRules.start}
+              auth requisite pam_unix.so nullok try_first_pass
+              ${pamRules.finish}
               account required pam_permit.so
             '';
-          });
+          })
+        // {
+          # A stack without start: pam_unix asks for the password itself.
+          test-finish.text = ''
+            auth requisite pam_unix.so nullok
+            ${pamRules.finish}
+            account required pam_permit.so
+          '';
+        };
     };
 
   testScript = ''
     import json
+    import shlex
     import time
 
     machine.wait_for_unit("pam-biometrics.service")
     machine.wait_for_file("/run/pam-biometrics/socket")
+
+    PROMPT = "?Password (Enter to scan face): "
+    FINISH = "?Touch the fingerprint reader, or press Enter to scan your face: "
+    PASSWORD = "!alice-password"
 
 
     def show(image):
@@ -125,11 +150,20 @@ testers.runNixOSTest {
         time.sleep(3)
 
 
-    def authenticate(service):
+    def no_helper():
+        """pam_end leaves no helper process."""
+        machine.fail("pgrep -f 'pam-biometrics pam-[s]ession'")
+
+
+    def converse(service, *steps):
+        """Authenticate alice through a terminal. See converse.py."""
+        command = shlex.join(["converse", service, "alice", *steps])
         start = time.monotonic()
-        status, output = machine.execute(f"pamtester {service} alice authenticate 2>&1")
+        status, output = machine.execute(command)
         elapsed = time.monotonic() - start
         print(f"{service}: status {status} after {elapsed:.1f} s\n{output}")
+        assert status in (0, 1), output
+        no_helper()
         return status, output, elapsed
 
 
@@ -187,12 +221,13 @@ testers.runNixOSTest {
         output = machine.fail("runuser -u bob -- pam-biometrics face scan alice")
         assert "permission denied" in output, output
 
-    with subtest("own face after a scan gives success"):
+    with subtest("a scan before the attempt counts without start"):
         show("${images.obama2}")
         machine.succeed("pam-biometrics face scan alice")
         output = machine.succeed("pam-biometrics face wait alice")
         assert output.strip() == "Face: recognized", output
-        status, output, _ = authenticate("test-own")
+        # pam_unix asks for the password itself.
+        status, output, _ = converse("test-finish", "?Password: ", PASSWORD)
         assert status == 0, output
         assert "Face recognized." in output, output
         assert "successfully authenticated" in output, output
@@ -203,54 +238,98 @@ testers.runNixOSTest {
         output = machine.succeed("runuser -u alice -- pam-biometrics face verify")
         assert "Verify result: verify-match (done)" in output, output
 
+    with subtest("the password alone gives success at once"):
+        status, output, elapsed = converse("test-own", PROMPT, PASSWORD)
+        assert status == 0, output
+        assert "successfully authenticated" in output, output
+        assert "Touch" not in output, output
+        assert elapsed < 5, elapsed
+
+    with subtest("a wrong password fails and stops the helper"):
+        status, output, _ = converse("test-own", PROMPT, "!wrong-password")
+        assert status == 1, output
+        assert "Authentication failure" in output, output
+
+    with subtest("Enter scans the face before the password"):
+        status, output, _ = converse(
+            "test-own", PROMPT, "!", "?Scanning face", "?Password: ", PASSWORD
+        )
+        assert status == 0, output
+        assert "Face recognized." in output, output
+        assert "successfully authenticated" in output, output
+        assert machine.succeed("pam-biometrics face status alice").strip() == ""
+
     with subtest("a stranger gives AUTH_ERR"):
         show("${images.biden-top}")
-        machine.succeed("pam-biometrics face scan alice")
-        output = machine.succeed("pam-biometrics face wait alice")
-        assert output.strip() == "Face: not recognized", output
-        status, output, _ = authenticate("test-own")
-        assert status != 0, output
+        status, output, _ = converse(
+            "test-own", PROMPT, "!", "?Scanning face", "?Password: ", PASSWORD
+        )
+        assert status == 1, output
         assert "Face not recognized." in output, output
         assert "Not recognized." in output, output
         assert "Authentication failure" in output, output
         machine.fail("runuser -u alice -- pam-biometrics face verify")
 
-    with subtest("no scan gives success through PAM_IGNORE"):
-        status, output, elapsed = authenticate("test-own")
+    with subtest("deny asks after the password, and Enter scans the face"):
+        show("${images.obama2}")
+        status, output, _ = converse("test-deny", PROMPT, PASSWORD, FINISH, "!")
         assert status == 0, output
-        assert "Touch the fingerprint reader or scan your face." in output, output
+        assert "Scanning face" in output, output
+        assert "Face recognized." in output, output
         assert "successfully authenticated" in output, output
-        assert elapsed >= 4, elapsed
 
-    with subtest("on_no_decision deny fails without a scan"):
-        status, output, _ = authenticate("test-deny")
-        assert status != 0, output
+    with subtest("deny fails without a factor"):
+        status, output, _ = converse("test-deny", PROMPT, PASSWORD, FINISH, "!no")
+        assert status == 1, output
+        assert "Scanning face" not in output, output
         assert "A fingerprint or a face is necessary." in output, output
         assert "Authentication failure" in output, output
 
-    with subtest("an empty factor list gives PAM_IGNORE at once"):
-        status, output, elapsed = authenticate("test-none")
+    with subtest("a custom trigger scans the face"):
+        trigger_prompt = "?Password (type f to scan face): "
+        status, output, _ = converse(
+            "test-trigger", trigger_prompt, "!f", "?Scanning face", "?Password: ", PASSWORD
+        )
         assert status == 0, output
-        assert "Touch" not in output, output
-        assert elapsed < 3, elapsed
+        assert "Face recognized." in output, output
+        # Enter alone is a password here.
+        status, output, _ = converse("test-trigger", trigger_prompt, "!")
+        assert status == 1, output
+        assert "Scanning face" not in output, output
 
-    with subtest("a second scan in the same attempt counts"):
+    with subtest("an empty factor list leaves the prompt to pam_unix"):
+        status, output, elapsed = converse("test-none", "?Password: ", PASSWORD)
+        assert status == 0, output
+        assert "scan face" not in output, output
+        assert elapsed < 5, elapsed
+
+    with subtest("key binding scans during the password prompt count"):
         show("${images.biden-top}")
+        inner = shlex.join(
+            ["converse", "test-rescan", "alice", PROMPT, "=/tmp/rescan-go", PASSWORD]
+        )
         machine.succeed(
             "systemd-run --unit=rescan-auth --collect /bin/sh -c "
-            "'/run/current-system/sw/bin/pamtester test-rescan alice authenticate "
-            "> /tmp/rescan.log 2>&1; echo $? > /tmp/rescan.status'"
+            + shlex.quote(
+                "export PATH=/run/current-system/sw/bin:$PATH; "
+                + inner
+                + " > /tmp/rescan.log 2>&1; echo $? > /tmp/rescan.status"
+            )
         )
-        time.sleep(1)
+        machine.wait_until_succeeds("pgrep -f 'pam-biometrics pam-[s]ession'")
         machine.succeed("pam-biometrics face scan alice")
         machine.succeed("pam-biometrics face wait alice")
-        # The PAM step took the reject and keeps waiting.
+        # The helper took the reject during the password prompt.
         machine.wait_until_succeeds(
             'test -z "$(pam-biometrics face status alice)"', timeout=10
         )
-        machine.fail("test -e /tmp/rescan.status")
         show("${images.obama2}")
         machine.succeed("pam-biometrics face scan alice")
+        machine.wait_until_succeeds(
+            'test -z "$(pam-biometrics face status alice)"', timeout=20
+        )
+        machine.fail("test -e /tmp/rescan.status")
+        machine.succeed("touch /tmp/rescan-go")
         machine.wait_for_file("/tmp/rescan.status", timeout=40)
         output = machine.succeed("cat /tmp/rescan.log")
         print(output)
@@ -258,6 +337,7 @@ testers.runNixOSTest {
         assert "Face not recognized." in output, output
         assert "Face recognized." in output, output
         assert "successfully authenticated" in output, output
+        no_helper()
 
     with subtest("finger commands report a missing reader"):
         status, output = machine.execute("pam-biometrics finger list alice")

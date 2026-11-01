@@ -26,6 +26,7 @@ boon = "0.6"
 clap = { version = "4", features = ["derive"] }
 cxx = "1"
 cxx-build = "1"
+libc = "0.2"
 nix = { version = "0.31", features = ["fs", "signal", "socket", "user"] }
 pkg-config = "0.3"
 serde = { version = "1", features = ["derive"] }

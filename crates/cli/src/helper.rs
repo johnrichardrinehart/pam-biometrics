@@ -1,96 +1,142 @@
-//! The PAM helper: `pam_biometrics.so` runs `pam-biometrics pam-helper`.
+//! The PAM helper: `pam_biometrics.so` runs `pam-biometrics pam-session`.
+//!
+//! The helper runs for one auth call of the PAM stack: from the `start`
+//! step before the password module to the `finish` step after it. The
+//! enabled factors run in the background for the whole time.
+//!
+//! # Protocol
+//!
+//! The module and the helper exchange lines over the standard input and
+//! output of the helper. A line is a word, then a space and a text for some
+//! words. No text contains a line break. Each side ignores unknown lines.
+//!
+//! The helper sends these lines first:
+//!
+//! | Line               | Meaning                                                     |
+//! |--------------------|-------------------------------------------------------------|
+//! | `off`              | No factor is enabled. The helper exits.                     |
+//! | `prompt TEXT`      | The first password prompt.                                  |
+//! | `reprompt TEXT`    | The password prompt after a face trigger. It differs from `prompt`. |
+//! | `trigger TEXT`     | The face trigger. Absent if the face factor is disabled.    |
+//! | `ready`            | The end of the settings. The factors run.                   |
+//!
+//! Then the module sends commands:
+//!
+//! | Command          | Effect                                                            |
+//! |------------------|-------------------------------------------------------------------|
+//! | `scan`           | Start a face scan for the user.                                   |
+//! | `state`          | The helper replies `state VERDICT FACE`.                          |
+//! | `finish`         | Decide the step, then exit with the step exit code.               |
+//! | `answer trigger` | The reply to `ask`: the response was the face trigger.            |
+//! | `answer other`   | The reply to `ask`: any other response.                           |
+//! | `stop`           | Stop the factors and exit. The end of the input does the same.    |
+//!
+//! The helper sends these lines at any time:
+//!
+//! | Line                   | Meaning                                                                 |
+//! |------------------------|-------------------------------------------------------------------------|
+//! | `info TEXT`            | A line for the user.                                                    |
+//! | `state VERDICT FACE`   | VERDICT is `success`, `reject`, or `pending`. FACE is `scanning` or `idle`. |
+//! | `ask TEXT`             | `finish` needs a response to the prompt TEXT. The module sends `answer`. |
+//!
+//! The password never goes to the helper. The exit code gives the result of
+//! the step: 0 for a match, 10 for a reject, and 20 without a decision.
 
-use std::io::Write;
+use std::io::{BufRead as _, Write};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 
-use pam_biometrics_policy::{
-    Combine, EXIT_NO_DECISION, Factor, Outcome, Policy, Settings, StepOutcome,
-};
+use pam_biometrics_policy::{Combine, EXIT_NO_DECISION, Factor, Policy, Settings};
 
 use crate::face::{Daemon, FaceTask};
 use crate::fingerprint::FingerprintTask;
-use crate::step::{self, FactorTask, StepResult};
+use crate::session::{Command, Event, FactorTask, Input, Session, Stop};
 
-/// The prompt when both factors are enabled and nothing else sets it.
-pub const DEFAULT_PROMPT: &str = "Touch the fingerprint reader or scan your face.";
+/// The password prompt after a trigger, unless the first prompt is the
+/// same text.
+const REPROMPT: &str = "Password: ";
 
-/// Returns the line that the step shows when it starts to wait.
+/// The text that names the trigger in the default prompts.
+fn trigger_hint(trigger: &str, capital: bool) -> String {
+    match (trigger.is_empty(), capital) {
+        (true, false) => "press Enter".to_owned(),
+        (true, true) => "Press Enter".to_owned(),
+        (false, false) => format!("type {trigger}"),
+        (false, true) => format!("Type {trigger}"),
+    }
+}
+
+/// Returns the first password prompt of `start`.
 #[must_use]
-pub fn prompt(settings: &Settings, flag: Option<&str>) -> Option<String> {
-    if settings.factors.is_empty() {
-        return None;
+pub fn password_prompt(settings: &Settings) -> String {
+    if let Some(prompt) = &settings.password_prompt {
+        return prompt.clone();
     }
-    if let Some(prompt) = flag.or(settings.prompt.as_deref()) {
-        return Some(prompt.to_owned());
+    if !settings.enabled(Factor::Face) {
+        return "Password: ".to_owned();
     }
-    let text = match (
+    let trigger = &settings.face.trigger;
+    if trigger.is_empty() {
+        "Password (Enter to scan face): ".to_owned()
+    } else {
+        format!("Password (type {trigger} to scan face): ")
+    }
+}
+
+/// Returns the password prompt after a trigger. It differs from `first`,
+/// so that an application that answers a repeated prompt with the last
+/// response does not start scans in a loop.
+#[must_use]
+pub fn reprompt(first: &str) -> String {
+    if first == REPROMPT {
+        "Password (face scan started): ".to_owned()
+    } else {
+        REPROMPT.to_owned()
+    }
+}
+
+/// Returns the prompt of `finish` after the password.
+#[must_use]
+pub fn finish_prompt(settings: &Settings) -> String {
+    if let Some(prompt) = &settings.finish_prompt {
+        return prompt.clone();
+    }
+    let trigger = &settings.face.trigger;
+    match (
         settings.enabled(Factor::Fingerprint),
         settings.enabled(Factor::Face),
+        settings.combine,
     ) {
-        (true, true) => DEFAULT_PROMPT,
-        (true, false) => "Touch the fingerprint reader.",
-        _ => "Scan your face.",
-    };
-    Some(text.to_owned())
+        (true, true, Combine::Any) => format!(
+            "Touch the fingerprint reader, or {} to scan your face: ",
+            trigger_hint(trigger, false)
+        ),
+        (true, true, Combine::All) => format!(
+            "Touch the fingerprint reader and {} to scan your face: ",
+            trigger_hint(trigger, false)
+        ),
+        (true, false, _) => "Touch the fingerprint reader, then press Enter: ".to_owned(),
+        _ => format!("{} to scan your face: ", trigger_hint(trigger, true)),
+    }
 }
 
-/// Returns the line that the step shows after the decision.
+/// Returns the lines that the helper sends before the commands.
 #[must_use]
-pub fn conclusion(settings: &Settings, result: &StepResult) -> Option<String> {
-    match result.verdict.combined {
-        Outcome::Match => {
-            let lines: Vec<&str> = settings
-                .factors
-                .iter()
-                .filter(|factor| result.finished.get(factor) == Some(&Outcome::Match))
-                .map(|factor| match factor {
-                    Factor::Fingerprint => "Fingerprint recognized.",
-                    Factor::Face => "Face recognized.",
-                })
-                .collect();
-            Some(lines.join("\n"))
-        }
-        Outcome::Reject => Some("Not recognized.".to_owned()),
-        Outcome::NoDecision if result.verdict.outcome == StepOutcome::Reject => {
-            let fingerprint = settings.enabled(Factor::Fingerprint);
-            let face = settings.enabled(Factor::Face);
-            Some(
-                match (fingerprint, face, settings.combine) {
-                    (true, true, Combine::Any) => "A fingerprint or a face is necessary.",
-                    (true, true, Combine::All) => "A fingerprint and a face are necessary.",
-                    (true, false, _) => "A fingerprint is necessary.",
-                    _ => "A face is necessary.",
-                }
-                .to_owned(),
-            )
-        }
-        Outcome::NoDecision => None,
-    }
-}
-
-/// Runs the step with `tasks` and writes the user-facing lines to `out`.
-/// Returns the helper exit code.
-pub fn decide(
-    settings: &Settings,
-    tasks: Vec<Box<dyn FactorTask>>,
-    prompt_flag: Option<&str>,
-    out: &mut dyn Write,
-) -> i32 {
+pub fn greeting(settings: &Settings) -> Vec<String> {
     if settings.factors.is_empty() {
-        return EXIT_NO_DECISION;
+        return vec!["off".to_owned()];
     }
-    if let Some(prompt) = prompt(settings, prompt_flag) {
-        let _ = writeln!(out, "{prompt}");
-        let _ = out.flush();
+    let first = password_prompt(settings);
+    let mut lines = vec![
+        format!("prompt {first}"),
+        format!("reprompt {}", reprompt(&first)),
+    ];
+    if settings.enabled(Factor::Face) {
+        lines.push(format!("trigger {}", settings.face.trigger));
     }
-    let timeout = Duration::from_secs(u64::from(settings.timeout_seconds));
-    let result = step::run(settings, tasks, timeout, out);
-    if let Some(line) = conclusion(settings, &result) {
-        let _ = writeln!(out, "{line}");
-        let _ = out.flush();
-    }
-    result.verdict.outcome.exit_code()
+    lines.push("ready".to_owned());
+    lines
 }
 
 /// The PAM environment of the helper.
@@ -118,21 +164,70 @@ impl PamEnv {
     }
 }
 
-/// Runs the helper for the PAM environment of the process.
-pub fn run(policy_path: &Path, socket: &Path, prompt_flag: Option<&str>) -> i32 {
+/// Reads the commands of the module from the standard input.
+fn read_commands(inputs: Sender<Input>) {
+    thread::spawn(move || {
+        for line in std::io::stdin().lock().lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            if let Some(command) = Command::parse(&line)
+                && inputs.send(Input::Command(command)).is_err()
+            {
+                return;
+            }
+        }
+        let _ = inputs.send(Input::Closed);
+    });
+}
+
+/// Passes the factor events to the session.
+fn forward(events: Receiver<Event>, inputs: Sender<Input>) {
+    thread::spawn(move || {
+        for event in events {
+            if inputs.send(Input::Event(event)).is_err() {
+                return;
+            }
+        }
+    });
+}
+
+/// Runs the helper session for the PAM environment of the process.
+pub fn run(policy_path: &Path, socket: &Path) -> i32 {
+    let mut out = std::io::stdout().lock();
+    let off = |out: &mut dyn Write| {
+        let _ = writeln!(out, "off");
+        let _ = out.flush();
+        EXIT_NO_DECISION
+    };
     let Some(env) = PamEnv::from_vars(|name| std::env::var(name).ok()) else {
-        return EXIT_NO_DECISION;
+        return off(&mut out);
     };
     let policy = match Policy::load(policy_path) {
         Ok(policy) => policy,
         Err(error) => {
             eprintln!("pam-biometrics: {error}");
-            return EXIT_NO_DECISION;
+            return off(&mut out);
         }
     };
     let settings = policy.resolve(env.service.as_deref(), Some(&env.user));
-    let deadline = Instant::now() + Duration::from_secs(u64::from(settings.timeout_seconds));
-    let tasks: Vec<Box<dyn FactorTask>> = settings
+    for line in greeting(&settings) {
+        let _ = writeln!(out, "{line}");
+    }
+    let _ = out.flush();
+    if settings.factors.is_empty() {
+        return EXIT_NO_DECISION;
+    }
+
+    let daemon = || Daemon {
+        socket: socket.to_owned(),
+        user: env.user.clone(),
+    };
+    let (input_sender, inputs) = mpsc::channel();
+    read_commands(input_sender.clone());
+    let (event_sender, events) = mpsc::channel();
+    forward(events, input_sender);
+    let stops: Vec<Box<dyn Stop>> = settings
         .factors
         .iter()
         .map(|factor| -> Box<dyn FactorTask> {
@@ -142,210 +237,132 @@ pub fn run(policy_path: &Path, socket: &Path, prompt_flag: Option<&str>) -> i32 
                     max_tries: settings.fingerprint.max_tries,
                 }),
                 Factor::Face => Box::new(FaceTask {
-                    source: Daemon {
-                        socket: socket.to_owned(),
-                        user: env.user.clone(),
-                    },
+                    source: daemon(),
                     face: settings.face.clone(),
-                    deadline,
                 }),
             }
         })
+        .map(|task| task.start(event_sender.clone()))
         .collect();
-    decide(&settings, tasks, prompt_flag, &mut std::io::stdout().lock())
+    drop(event_sender);
+
+    let code = Session::new(&settings, finish_prompt(&settings), inputs, daemon(), out).run();
+    for stop in stops {
+        stop.stop();
+    }
+    code
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
-    use std::sync::mpsc::Sender;
-    use std::thread;
-
-    use pam_biometrics_policy::{EXIT_REJECT, EXIT_SUCCESS, OnNoDecision, Verdict};
+    use std::collections::HashMap;
 
     use super::*;
-    use crate::fingerprint::RETRY_MESSAGE;
-    use crate::step::{Event, Stop};
-
-    struct Script(Vec<Event>);
-
-    struct NoStop;
-
-    impl Stop for NoStop {
-        fn stop(self: Box<Self>) {}
-    }
-
-    impl FactorTask for Script {
-        fn start(self: Box<Self>, events: Sender<Event>) -> Box<dyn Stop> {
-            thread::spawn(move || {
-                for event in self.0 {
-                    let _ = events.send(event);
-                }
-            });
-            Box::new(NoStop)
-        }
-    }
 
     fn settings(factors: &[Factor]) -> Settings {
         Settings {
             factors: factors.to_vec(),
-            timeout_seconds: 2,
             ..Settings::default()
         }
-    }
-
-    fn run_script(
-        settings: &Settings,
-        scripts: Vec<Vec<Event>>,
-        flag: Option<&str>,
-    ) -> (i32, String) {
-        let tasks = scripts
-            .into_iter()
-            .map(|script| Box::new(Script(script)) as Box<dyn FactorTask>)
-            .collect();
-        let mut out = Vec::new();
-        let code = decide(settings, tasks, flag, &mut out);
-        (code, String::from_utf8(out).unwrap())
     }
 
     const BOTH: &[Factor] = &[Factor::Fingerprint, Factor::Face];
 
     #[test]
-    fn prompts() {
+    fn default_password_prompts() {
+        let mut both = settings(BOTH);
+        assert_eq!(password_prompt(&both), "Password (Enter to scan face): ");
+        both.face.trigger = "f".to_owned();
+        assert_eq!(password_prompt(&both), "Password (type f to scan face): ");
+        // Without the face factor, the trigger means nothing.
+        let mut finger = settings(&[Factor::Fingerprint]);
+        finger.face.trigger = "f".to_owned();
+        assert_eq!(password_prompt(&finger), "Password: ");
         assert_eq!(
-            prompt(&settings(BOTH), None).as_deref(),
-            Some(DEFAULT_PROMPT)
+            password_prompt(&settings(&[Factor::Face])),
+            "Password (Enter to scan face): "
         );
-        assert_eq!(
-            prompt(&settings(&[Factor::Fingerprint]), None).as_deref(),
-            Some("Touch the fingerprint reader.")
-        );
-        assert_eq!(
-            prompt(&settings(&[Factor::Face]), None).as_deref(),
-            Some("Scan your face.")
-        );
-        assert_eq!(prompt(&settings(&[]), Some("ignored")), None);
+    }
 
+    #[test]
+    fn policy_prompts_replace_the_defaults() {
         let mut custom = settings(BOTH);
-        custom.prompt = Some("Touch the fingerprint reader or press Super+Alt+F.".to_owned());
+        custom.password_prompt = Some("Passphrase: ".to_owned());
+        custom.finish_prompt = Some("Press Super+Alt+F, then Enter: ".to_owned());
+        assert_eq!(password_prompt(&custom), "Passphrase: ");
+        assert_eq!(finish_prompt(&custom), "Press Super+Alt+F, then Enter: ");
+    }
+
+    #[test]
+    fn reprompt_differs_from_the_first_prompt() {
+        for first in [
+            "Password (Enter to scan face): ",
+            "Password: ",
+            "Passphrase: ",
+        ] {
+            assert_ne!(reprompt(first), first, "{first}");
+        }
+        assert_eq!(reprompt("Password (Enter to scan face): "), "Password: ");
+    }
+
+    #[test]
+    fn default_finish_prompts() {
+        let mut both = settings(BOTH);
         assert_eq!(
-            prompt(&custom, None).as_deref(),
-            Some("Touch the fingerprint reader or press Super+Alt+F.")
+            finish_prompt(&both),
+            "Touch the fingerprint reader, or press Enter to scan your face: "
+        );
+        both.face.trigger = "face".to_owned();
+        assert_eq!(
+            finish_prompt(&both),
+            "Touch the fingerprint reader, or type face to scan your face: "
+        );
+        both.combine = Combine::All;
+        assert_eq!(
+            finish_prompt(&both),
+            "Touch the fingerprint reader and type face to scan your face: "
         );
         assert_eq!(
-            prompt(&custom, Some("From the flag.")).as_deref(),
-            Some("From the flag.")
+            finish_prompt(&settings(&[Factor::Fingerprint])),
+            "Touch the fingerprint reader, then press Enter: "
         );
+        let mut face = settings(&[Factor::Face]);
+        assert_eq!(finish_prompt(&face), "Press Enter to scan your face: ");
+        face.face.trigger = "f".to_owned();
+        assert_eq!(finish_prompt(&face), "Type f to scan your face: ");
     }
 
     #[test]
-    fn fingerprint_match() {
-        let (code, out) = run_script(
-            &settings(BOTH),
-            vec![
-                vec![
-                    Event::Message(RETRY_MESSAGE.to_owned()),
-                    Event::Finished(Factor::Fingerprint, Outcome::Match),
-                ],
-                vec![],
-            ],
-            None,
-        );
-        assert_eq!(code, EXIT_SUCCESS);
+    fn greetings() {
+        assert_eq!(greeting(&settings(&[])), ["off"]);
         assert_eq!(
-            out,
-            format!("{DEFAULT_PROMPT}\n{RETRY_MESSAGE}\nFingerprint recognized.\n")
-        );
-    }
-
-    #[test]
-    fn face_match() {
-        let (code, out) = run_script(
-            &settings(BOTH),
-            vec![
-                vec![Event::Finished(Factor::Fingerprint, Outcome::NoDecision)],
-                vec![Event::Finished(Factor::Face, Outcome::Match)],
-            ],
-            None,
-        );
-        assert_eq!(code, EXIT_SUCCESS);
-        assert_eq!(out, format!("{DEFAULT_PROMPT}\nFace recognized.\n"));
-    }
-
-    #[test]
-    fn reject() {
-        let (code, out) = run_script(
-            &settings(BOTH),
-            vec![
-                vec![Event::Finished(Factor::Fingerprint, Outcome::Reject)],
-                vec![Event::Finished(Factor::Face, Outcome::NoDecision)],
-            ],
-            Some("Prompt."),
-        );
-        assert_eq!(code, EXIT_REJECT);
-        assert_eq!(out, "Prompt.\nNot recognized.\n");
-    }
-
-    #[test]
-    fn no_decision_allow_and_deny() {
-        let unavailable = || {
-            vec![
-                vec![Event::Finished(Factor::Fingerprint, Outcome::NoDecision)],
-                vec![Event::Finished(Factor::Face, Outcome::NoDecision)],
+            greeting(&settings(BOTH)),
+            [
+                "prompt Password (Enter to scan face): ",
+                "reprompt Password: ",
+                "trigger ",
+                "ready"
             ]
-        };
-        let (code, out) = run_script(&settings(BOTH), unavailable(), None);
-        assert_eq!(code, EXIT_NO_DECISION);
-        assert_eq!(out, format!("{DEFAULT_PROMPT}\n"));
-
-        let mut deny = settings(BOTH);
-        deny.on_no_decision = OnNoDecision::Deny;
-        let (code, out) = run_script(&deny, unavailable(), None);
-        assert_eq!(code, EXIT_REJECT);
-        assert_eq!(
-            out,
-            format!("{DEFAULT_PROMPT}\nA fingerprint or a face is necessary.\n")
         );
-    }
-
-    #[test]
-    fn empty_factors_print_nothing() {
-        let (code, out) = run_script(&settings(&[]), vec![], None);
-        assert_eq!(code, EXIT_NO_DECISION);
-        assert_eq!(out, "");
-    }
-
-    #[test]
-    fn conclusion_for_all() {
-        let mut all = settings(BOTH);
-        all.combine = Combine::All;
-        let both: BTreeMap<Factor, Outcome> = [
-            (Factor::Fingerprint, Outcome::Match),
-            (Factor::Face, Outcome::Match),
-        ]
-        .into();
-        let result = StepResult {
-            verdict: Verdict {
-                combined: Outcome::Match,
-                outcome: StepOutcome::Success,
-            },
-            finished: both,
-        };
+        let mut custom = settings(BOTH);
+        custom.face.trigger = "f".to_owned();
+        custom.password_prompt = Some("Password: ".to_owned());
         assert_eq!(
-            conclusion(&all, &result).as_deref(),
-            Some("Fingerprint recognized.\nFace recognized.")
+            greeting(&custom),
+            [
+                "prompt Password: ",
+                "reprompt Password (face scan started): ",
+                "trigger f",
+                "ready"
+            ]
         );
-        all.on_no_decision = OnNoDecision::Deny;
-        let denied = StepResult {
-            verdict: Verdict {
-                combined: Outcome::NoDecision,
-                outcome: StepOutcome::Reject,
-            },
-            finished: BTreeMap::new(),
-        };
         assert_eq!(
-            conclusion(&all, &denied).as_deref(),
-            Some("A fingerprint and a face are necessary.")
+            greeting(&settings(&[Factor::Fingerprint])),
+            [
+                "prompt Password: ",
+                "reprompt Password (face scan started): ",
+                "ready"
+            ]
         );
     }
 

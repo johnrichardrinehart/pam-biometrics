@@ -108,16 +108,37 @@ in
       '';
     };
 
-    pamRule = lib.mkOption {
-      type = lib.types.str;
-      readOnly = true;
-      default = "auth [success=ok ignore=ignore default=die] ${cfg.package}/lib/security/pam_biometrics.so";
-      defaultText = lib.literalExpression ''"auth [success=ok ignore=ignore default=die] ''${cfg.package}/lib/security/pam_biometrics.so"'';
-      description = ''
-        The PAM line of the biometric step. Put it after the password
-        module of each PAM service that uses it.
-      '';
-    };
+    pamRules =
+      let
+        rule =
+          mode: description:
+          lib.mkOption {
+            type = lib.types.str;
+            readOnly = true;
+            default = "auth [success=ok ignore=ignore default=die] ${cfg.package}/lib/security/pam_biometrics.so ${mode}";
+            defaultText = lib.literalExpression ''"auth [success=ok ignore=ignore default=die] ''${cfg.package}/lib/security/pam_biometrics.so ${mode}"'';
+            description = ''
+              ${description} Each PAM service that uses pam-biometrics has
+              this auth stack:
+
+              ```
+              ''${config.services.pam-biometrics.pamRules.start}
+              auth requisite pam_unix.so nullok try_first_pass
+              ''${config.services.pam-biometrics.pamRules.finish}
+              auth optional pam_gnome_keyring.so
+              ```
+
+              `start` asks for the password and gives it to `pam_unix`
+              through `try_first_pass`. The face trigger as a response
+              starts a face scan. `finish` decides after the password. The
+              last line is optional.
+            '';
+          };
+      in
+      {
+        start = rule "start" "The PAM line of the biometric step before the password module.";
+        finish = rule "finish" "The PAM line of the biometric step after the password module.";
+      };
   };
 
   config = lib.mkIf cfg.enable {

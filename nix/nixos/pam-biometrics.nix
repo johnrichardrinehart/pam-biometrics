@@ -130,8 +130,12 @@ in
 
               `start` asks for the password and gives it to `pam_unix`
               through `try_first_pass`. The face trigger as a response
-              starts a face scan. `finish` decides after the password. The
-              last line is optional.
+              starts a face scan. `finish` asks nothing: a match or a
+              reject so far decides at once, otherwise it shows
+              `wait_message` and waits up to `timeout_seconds` for a
+              finger or a face, then `on_no_decision` applies. On a
+              terminal in line mode, the face trigger typed during the
+              wait starts a scan. The last line is optional.
             '';
           };
       in

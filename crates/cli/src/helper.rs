@@ -22,14 +22,14 @@
 //!
 //! Then the module sends commands:
 //!
-//! | Command          | Effect                                                            |
-//! |------------------|-------------------------------------------------------------------|
-//! | `scan`           | Start a face scan for the user.                                   |
-//! | `state`          | The helper replies `state VERDICT FACE`.                          |
-//! | `finish`         | Decide the step, then exit with the step exit code.               |
-//! | `answer trigger` | The reply to `ask`: the response was the face trigger.            |
-//! | `answer other`   | The reply to `ask`: any other response.                           |
-//! | `stop`           | Stop the factors and exit. The end of the input does the same.    |
+//! | Command  | Effect                                                                          |
+//! |----------|---------------------------------------------------------------------------------|
+//! | `scan`   | Start a face scan for the user.                                                 |
+//! | `state`  | The helper replies `state VERDICT FACE`.                                        |
+//! | `finish` | Wait for a decision until the timeout, then exit with the step exit code.      |
+//! | `stop`   | Stop the factors and exit. The end of the input does the same.                  |
+//!
+//! The module may send `scan` during the wait of `finish`.
 //!
 //! The helper sends these lines at any time:
 //!
@@ -37,7 +37,6 @@
 //! |------------------------|-------------------------------------------------------------------------|
 //! | `info TEXT`            | A line for the user.                                                    |
 //! | `state VERDICT FACE`   | VERDICT is `success`, `reject`, or `pending`. FACE is `scanning` or `idle`. |
-//! | `ask TEXT`             | `finish` needs a response to the prompt TEXT. The module sends `answer`. |
 //!
 //! The password never goes to the helper. The exit code gives the result of
 //! the step: 0 for a match, 10 for a reject, and 20 without a decision.
@@ -96,28 +95,32 @@ pub fn reprompt(first: &str) -> String {
     }
 }
 
-/// Returns the prompt of `finish` after the password.
+/// Returns the information line that `finish` shows when it waits.
 #[must_use]
-pub fn finish_prompt(settings: &Settings) -> String {
-    if let Some(prompt) = &settings.finish_prompt {
-        return prompt.clone();
+pub fn wait_message(settings: &Settings) -> String {
+    if let Some(message) = &settings.wait_message {
+        return message.clone();
     }
     let trigger = &settings.face.trigger;
+    let seconds = settings.timeout_seconds;
     match (
         settings.enabled(Factor::Fingerprint),
         settings.enabled(Factor::Face),
         settings.combine,
     ) {
         (true, true, Combine::Any) => format!(
-            "Touch the fingerprint reader, or {} to scan your face: ",
+            "Touch the fingerprint reader or {} to scan your face ({seconds} s).",
             trigger_hint(trigger, false)
         ),
         (true, true, Combine::All) => format!(
-            "Touch the fingerprint reader and {} to scan your face: ",
+            "Touch the fingerprint reader and {} to scan your face ({seconds} s).",
             trigger_hint(trigger, false)
         ),
-        (true, false, _) => "Touch the fingerprint reader, then press Enter: ".to_owned(),
-        _ => format!("{} to scan your face: ", trigger_hint(trigger, true)),
+        (true, false, _) => format!("Touch the fingerprint reader ({seconds} s)."),
+        _ => format!(
+            "{} to scan your face ({seconds} s).",
+            trigger_hint(trigger, true)
+        ),
     }
 }
 
@@ -246,7 +249,7 @@ pub fn run(policy_path: &Path, socket: &Path) -> i32 {
         .collect();
     drop(event_sender);
 
-    let code = Session::new(&settings, finish_prompt(&settings), inputs, daemon(), out).run();
+    let code = Session::new(&settings, wait_message(&settings), inputs, daemon(), out).run();
     for stop in stops {
         stop.stop();
     }
@@ -288,9 +291,9 @@ mod tests {
     fn policy_prompts_replace_the_defaults() {
         let mut custom = settings(BOTH);
         custom.password_prompt = Some("Passphrase: ".to_owned());
-        custom.finish_prompt = Some("Press Super+Alt+F, then Enter: ".to_owned());
+        custom.wait_message = Some("Press Super+Alt+F.".to_owned());
         assert_eq!(password_prompt(&custom), "Passphrase: ");
-        assert_eq!(finish_prompt(&custom), "Press Super+Alt+F, then Enter: ");
+        assert_eq!(wait_message(&custom), "Press Super+Alt+F.");
     }
 
     #[test]
@@ -306,30 +309,31 @@ mod tests {
     }
 
     #[test]
-    fn default_finish_prompts() {
+    fn default_wait_messages() {
         let mut both = settings(BOTH);
         assert_eq!(
-            finish_prompt(&both),
-            "Touch the fingerprint reader, or press Enter to scan your face: "
+            wait_message(&both),
+            "Touch the fingerprint reader or press Enter to scan your face (15 s)."
         );
         both.face.trigger = "face".to_owned();
+        both.timeout_seconds = 3;
         assert_eq!(
-            finish_prompt(&both),
-            "Touch the fingerprint reader, or type face to scan your face: "
+            wait_message(&both),
+            "Touch the fingerprint reader or type face to scan your face (3 s)."
         );
         both.combine = Combine::All;
         assert_eq!(
-            finish_prompt(&both),
-            "Touch the fingerprint reader and type face to scan your face: "
+            wait_message(&both),
+            "Touch the fingerprint reader and type face to scan your face (3 s)."
         );
         assert_eq!(
-            finish_prompt(&settings(&[Factor::Fingerprint])),
-            "Touch the fingerprint reader, then press Enter: "
+            wait_message(&settings(&[Factor::Fingerprint])),
+            "Touch the fingerprint reader (15 s)."
         );
         let mut face = settings(&[Factor::Face]);
-        assert_eq!(finish_prompt(&face), "Press Enter to scan your face: ");
+        assert_eq!(wait_message(&face), "Press Enter to scan your face (15 s).");
         face.face.trigger = "f".to_owned();
-        assert_eq!(finish_prompt(&face), "Type f to scan your face: ");
+        assert_eq!(wait_message(&face), "Type f to scan your face (15 s).");
     }
 
     #[test]

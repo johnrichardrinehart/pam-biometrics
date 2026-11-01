@@ -11,11 +11,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use pam_biometrics_policy::{
-    Combine, EXIT_NO_DECISION, Factor, OnNoDecision, Outcome, Settings, StepOutcome, Verdict,
+    Combine, EXIT_NO_DECISION, Factor, Outcome, Settings, StepOutcome, Verdict,
 };
-
-/// `finish` waits at most this long for the first poll of the face factor.
-const FIRST_POLL_LIMIT: Duration = Duration::from_secs(5);
 
 /// A message from a running factor.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,15 +50,6 @@ pub trait FaceControl {
     fn scanning(&mut self) -> bool;
 }
 
-/// The response of the user to an `ask` line.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Answer {
-    /// The response was the face trigger.
-    Trigger,
-    /// Any other response.
-    Other,
-}
-
 /// A command from the PAM module.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
@@ -71,8 +59,6 @@ pub enum Command {
     State,
     /// `finish`: decide the step, then exit.
     Finish,
-    /// `answer trigger` or `answer other`: the response to `ask`.
-    Answer(Answer),
     /// `stop`: stop the factors and exit.
     Stop,
 }
@@ -85,8 +71,6 @@ impl Command {
             "scan" => Self::Scan,
             "state" => Self::State,
             "finish" => Self::Finish,
-            "answer trigger" => Self::Answer(Answer::Trigger),
-            "answer other" => Self::Answer(Answer::Other),
             "stop" => Self::Stop,
             _ => return None,
         })
@@ -159,8 +143,6 @@ enum Next {
     Handled,
     /// `finish`.
     Finish,
-    /// `answer`.
-    Answer(Answer),
     /// `stop`, or the PAM module closed the connection.
     End,
     /// The deadline passed.
@@ -171,7 +153,7 @@ enum Next {
 #[derive(Debug)]
 pub struct Session<'a, F, W> {
     settings: &'a Settings,
-    finish_prompt: String,
+    wait_message: String,
     inputs: Receiver<Input>,
     face: F,
     out: W,
@@ -179,31 +161,27 @@ pub struct Session<'a, F, W> {
     finished: BTreeMap<Factor, Outcome>,
     /// The last outcome of each factor that still runs.
     provisional: BTreeMap<Factor, Outcome>,
-    /// The user asked for a face scan in `finish`. The next face result
-    /// ends the face factor.
-    face_final: bool,
     /// The factors that asked their source at least once.
     polled: BTreeSet<Factor>,
 }
 
 impl<'a, F: FaceControl, W: Write> Session<'a, F, W> {
-    /// Creates a session. `finish_prompt` is the text of the `ask` line.
+    /// Creates a session. `finish` shows `wait_message` when it waits.
     pub fn new(
         settings: &'a Settings,
-        finish_prompt: String,
+        wait_message: String,
         inputs: Receiver<Input>,
         face: F,
         out: W,
     ) -> Self {
         Self {
             settings,
-            finish_prompt,
+            wait_message,
             inputs,
             face,
             out,
             finished: BTreeMap::new(),
             provisional: BTreeMap::new(),
-            face_final: false,
             polled: BTreeSet::new(),
         }
     }
@@ -213,7 +191,7 @@ impl<'a, F: FaceControl, W: Write> Session<'a, F, W> {
     pub fn run(mut self) -> i32 {
         loop {
             match self.next(None) {
-                Next::Handled | Next::Answer(_) | Next::Timeout => {}
+                Next::Handled | Next::Timeout => {}
                 Next::Finish => return self.finish(),
                 Next::End => return EXIT_NO_DECISION,
             }
@@ -247,12 +225,9 @@ impl<'a, F: FaceControl, W: Write> Session<'a, F, W> {
         };
         match input {
             Input::Event(event) => self.on_event(event),
-            Input::Command(Command::Scan) => {
-                self.scan();
-            }
+            Input::Command(Command::Scan) => self.scan(),
             Input::Command(Command::State) => self.report_state(),
             Input::Command(Command::Finish) => return Next::Finish,
-            Input::Command(Command::Answer(answer)) => return Next::Answer(answer),
             Input::Command(Command::Stop) | Input::Closed => return Next::End,
         }
         Next::Handled
@@ -265,10 +240,6 @@ impl<'a, F: FaceControl, W: Write> Session<'a, F, W> {
                 self.polled.insert(factor);
             }
             Event::Provisional(factor, outcome) => {
-                if factor == Factor::Face && self.face_final {
-                    self.face_final = false;
-                    self.finished.insert(factor, outcome);
-                }
                 // With `combine: all`, a reject decides: no later outcome
                 // can make the step succeed.
                 if self.settings.combine == Combine::All && outcome == Outcome::Reject {
@@ -280,24 +251,16 @@ impl<'a, F: FaceControl, W: Write> Session<'a, F, W> {
                 if outcome == Outcome::Match {
                     self.info(recognized(factor));
                 }
-                if factor == Factor::Face {
-                    self.face_final = false;
-                }
                 self.finished.insert(factor, outcome);
             }
         }
     }
 
-    /// Starts a face scan. Returns false if no scan runs.
-    fn scan(&mut self) -> bool {
-        if !self.settings.enabled(Factor::Face) {
-            return false;
-        }
-        let started = self.face.scan();
-        if !started {
+    /// Starts a face scan.
+    fn scan(&mut self) {
+        if self.settings.enabled(Factor::Face) && !self.face.scan() {
             self.info("The face scan did not start.");
         }
-        started
     }
 
     fn report_state(&mut self) {
@@ -338,14 +301,6 @@ impl<'a, F: FaceControl, W: Write> Session<'a, F, W> {
             .expect("the policy decides after the deadline")
     }
 
-    /// Returns true if the after-password path can change the result.
-    /// Without a match or a reject, `allow` with `any` gives `PAM_IGNORE`
-    /// whatever happens next. With `all`, an open result means that a
-    /// factor still lacks a match.
-    fn can_matter(&self) -> bool {
-        self.settings.on_no_decision == OnNoDecision::Deny || self.settings.combine == Combine::All
-    }
-
     fn conclude(&mut self, verdict: Verdict) -> i32 {
         if let Some(line) = conclusion(self.settings, verdict) {
             self.info(line);
@@ -353,70 +308,38 @@ impl<'a, F: FaceControl, W: Write> Session<'a, F, W> {
         verdict.outcome.exit_code()
     }
 
-    fn deadline(&self) -> Instant {
-        Instant::now() + Duration::from_secs(u64::from(self.settings.timeout_seconds))
-    }
-
-    /// Decides the step after the password.
+    /// Decides the step after the password. A match or a reject so far
+    /// decides at once. Otherwise `finish` shows the wait message and waits
+    /// for a match or a reject until `timeout_seconds` after its start.
+    /// Without one, `on_no_decision` applies.
     fn finish(mut self) -> i32 {
+        let deadline =
+            Instant::now() + Duration::from_secs(u64::from(self.settings.timeout_seconds));
         // A result that the daemon held before the session counts, also
         // when `finish` comes right after the start of the session.
-        let deadline = Instant::now() + FIRST_POLL_LIMIT;
         while self.settings.enabled(Factor::Face) && !self.polled.contains(&Factor::Face) {
             match self.next(Some(deadline)) {
                 Next::Timeout => break,
                 Next::End => return EXIT_NO_DECISION,
-                Next::Handled | Next::Finish | Next::Answer(_) => {}
+                Next::Handled | Next::Finish => {}
             }
         }
         if let Some(verdict) = self.settled() {
             return self.conclude(verdict);
         }
-        if self.can_matter() {
-            let line = format!("ask {}", self.finish_prompt);
-            self.send(&line);
-            let answer = loop {
-                match self.next(None) {
-                    Next::Answer(answer) => break answer,
-                    Next::End => return EXIT_NO_DECISION,
-                    Next::Handled | Next::Finish | Next::Timeout => {}
-                }
-            };
-            if let Some(verdict) = self.settled() {
-                return self.conclude(verdict);
-            }
-            if answer == Answer::Trigger && self.scan() {
-                self.face_final = true;
-                let deadline = self.deadline();
-                return self.wait(deadline, false);
-            }
-        } else if self.settings.enabled(Factor::Face) && self.face.scanning() {
-            self.face_final = true;
-            let deadline = self.deadline();
-            return self.wait(deadline, true);
-        }
-        let verdict = self.current();
-        self.conclude(verdict)
-    }
-
-    /// Waits until the policy decides or `deadline` passes. With
-    /// `face_only`, also ends when the face factor ends.
-    fn wait(mut self, deadline: Instant, face_only: bool) -> i32 {
+        let message = self.wait_message.clone();
+        self.info(&message);
         loop {
-            if let Some(verdict) = self.settings.decide(&self.finished, false) {
-                return self.conclude(verdict);
-            }
-            if face_only && self.finished.contains_key(&Factor::Face) {
-                let verdict = self.current();
-                return self.conclude(verdict);
-            }
             match self.next(Some(deadline)) {
                 Next::Timeout => {
                     let verdict = self.current();
                     return self.conclude(verdict);
                 }
                 Next::End => return EXIT_NO_DECISION,
-                Next::Handled | Next::Finish | Next::Answer(_) => {}
+                Next::Handled | Next::Finish => {}
+            }
+            if let Some(verdict) = self.settled() {
+                return self.conclude(verdict);
             }
         }
     }
@@ -427,12 +350,14 @@ mod tests {
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
 
-    use pam_biometrics_policy::{EXIT_REJECT, EXIT_SUCCESS};
+    use pam_biometrics_policy::{EXIT_REJECT, EXIT_SUCCESS, OnNoDecision};
 
     use super::*;
 
     const BOTH: &[Factor] = &[Factor::Fingerprint, Factor::Face];
-    const ASK: &str = "ask Touch the fingerprint reader, or press Enter to scan your face: ";
+    const WAIT: &str = "Touch the fingerprint reader or press Enter to scan your face (1 s).";
+    const INFO_WAIT: &str =
+        "info Touch the fingerprint reader or press Enter to scan your face (1 s).";
 
     /// A face daemon that records the scans.
     #[derive(Clone, Default)]
@@ -483,13 +408,18 @@ mod tests {
         }
     }
 
+    fn message(text: &str) -> Input {
+        Input::Event(Event::Message(text.to_owned()))
+    }
+
     fn command(command: Command) -> Input {
         Input::Command(command)
     }
 
     /// Runs a session. Each input waits for its delay in milliseconds. The
     /// face factor has polled once before the inputs. Returns the exit
-    /// code, the output lines, the number of scans, and the time.
+    /// code, the output lines, the number of scans, and the time from the
+    /// start of the session.
     fn run(
         settings: &Settings,
         face_control: FakeFace,
@@ -514,19 +444,12 @@ mod tests {
                 }
             }
             // Keep the channel open, as the stdin thread does.
-            thread::sleep(FIRST_POLL_LIMIT + Duration::from_secs(1));
+            thread::sleep(Duration::from_secs(3));
         });
         let scans = Arc::clone(&face_control.scans);
         let mut out = Vec::new();
         let start = Instant::now();
-        let code = Session::new(
-            settings,
-            ASK.trim_start_matches("ask ").to_owned(),
-            receiver,
-            face_control,
-            &mut out,
-        )
-        .run();
+        let code = Session::new(settings, WAIT.to_owned(), receiver, face_control, &mut out).run();
         let elapsed = start.elapsed();
         drop(feeder);
         let lines = String::from_utf8(out)
@@ -543,31 +466,57 @@ mod tests {
         assert_eq!(Command::parse("scan"), Some(Command::Scan));
         assert_eq!(Command::parse("state\n"), Some(Command::State));
         assert_eq!(Command::parse("finish\r\n"), Some(Command::Finish));
-        assert_eq!(
-            Command::parse("answer trigger"),
-            Some(Command::Answer(Answer::Trigger))
-        );
-        assert_eq!(
-            Command::parse("answer other"),
-            Some(Command::Answer(Answer::Other))
-        );
         assert_eq!(Command::parse("stop"), Some(Command::Stop));
-        for line in ["", "Scan", "scan now", "answer", "answer secret", " stop"] {
+        for line in [
+            "",
+            "Scan",
+            "scan now",
+            "answer trigger",
+            "answer other",
+            " stop",
+        ] {
             assert_eq!(Command::parse(line), None, "{line:?}");
         }
     }
 
     #[test]
-    fn password_only_with_allow_does_not_ask() {
+    fn allow_without_a_factor_waits_then_gives_no_decision() {
         let (code, lines, scans, elapsed) = run(
             &allow(),
             FakeFace::default(),
             vec![(0, command(Command::Finish))],
         );
         assert_eq!(code, EXIT_NO_DECISION);
-        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!(lines, [INFO_WAIT]);
         assert_eq!(scans, 0);
-        assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+        assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
+        assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+    }
+
+    #[test]
+    fn deny_without_a_factor_waits_then_rejects() {
+        let (code, lines, _, elapsed) = run(
+            &deny(),
+            FakeFace::default(),
+            vec![(0, command(Command::Finish))],
+        );
+        assert_eq!(code, EXIT_REJECT);
+        assert_eq!(
+            lines,
+            [INFO_WAIT, "info A fingerprint or a face is necessary."]
+        );
+        assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
+    }
+
+    #[test]
+    fn the_timeout_counts_from_the_start_of_finish() {
+        let (code, _, _, elapsed) = run(
+            &allow(),
+            FakeFace::default(),
+            vec![(500, command(Command::Finish))],
+        );
+        assert_eq!(code, EXIT_NO_DECISION);
+        assert!(elapsed >= Duration::from_millis(1500), "{elapsed:?}");
     }
 
     #[test]
@@ -583,17 +532,19 @@ mod tests {
             ],
         );
         assert_eq!(code, EXIT_SUCCESS);
+        // A decision before the wait shows no wait message.
         assert_eq!(lines, ["info Face recognized."]);
         assert!(elapsed < Duration::from_millis(900), "{elapsed:?}");
 
-        // Without a poll, the wait ends at its limit.
-        let (code, _, _, elapsed) = run_inputs(
+        // Without a poll, the timeout still ends the wait.
+        let (code, lines, _, elapsed) = run_inputs(
             &allow(),
             FakeFace::default(),
             vec![(0, command(Command::Finish))],
         );
         assert_eq!(code, EXIT_NO_DECISION);
-        assert!(elapsed >= FIRST_POLL_LIMIT, "{elapsed:?}");
+        assert_eq!(lines, [INFO_WAIT]);
+        assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
     }
 
     #[test]
@@ -602,12 +553,7 @@ mod tests {
             &deny(),
             FakeFace::default(),
             vec![
-                (
-                    0,
-                    Input::Event(Event::Message(
-                        "Fingerprint not recognized. Try again.".to_owned(),
-                    )),
-                ),
+                (0, message("Fingerprint not recognized. Try again.")),
                 (0, fingerprint(Outcome::Match)),
                 (50, command(Command::Finish)),
             ],
@@ -624,176 +570,107 @@ mod tests {
     }
 
     #[test]
-    fn finger_after_password_with_deny() {
-        let (code, lines, scans, _) = run(
-            &deny(),
-            FakeFace::default(),
-            vec![
-                (0, command(Command::Finish)),
-                (50, fingerprint(Outcome::Match)),
-                (50, command(Command::Answer(Answer::Other))),
-            ],
-        );
-        assert_eq!(code, EXIT_SUCCESS);
-        assert_eq!(lines, [ASK, "info Fingerprint recognized."]);
-        // A match before the response needs no face scan.
-        assert_eq!(scans, 0);
+    fn match_during_the_wait_succeeds_at_once() {
+        for on_no_decision in [OnNoDecision::Allow, OnNoDecision::Deny] {
+            let (code, lines, _, elapsed) = run(
+                &settings(Combine::Any, on_no_decision),
+                FakeFace::default(),
+                vec![
+                    (0, command(Command::Finish)),
+                    (100, fingerprint(Outcome::Match)),
+                ],
+            );
+            assert_eq!(code, EXIT_SUCCESS);
+            assert_eq!(lines, [INFO_WAIT, "info Fingerprint recognized."]);
+            assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+        }
     }
 
     #[test]
-    fn finger_during_the_face_wait() {
-        let (code, lines, scans, _) = run(
-            &deny(),
-            FakeFace::default(),
-            vec![
-                (0, command(Command::Finish)),
-                (0, command(Command::Answer(Answer::Trigger))),
-                (100, fingerprint(Outcome::Match)),
-            ],
-        );
-        assert_eq!(code, EXIT_SUCCESS);
-        assert_eq!(lines, [ASK, "info Fingerprint recognized."]);
-        assert_eq!(scans, 1);
-    }
-
-    #[test]
-    fn face_before_password() {
-        let (code, lines, scans, _) = run(
-            &allow(),
-            FakeFace::default(),
-            vec![
-                (0, command(Command::Scan)),
-                (50, face(Outcome::Match)),
-                (50, command(Command::Finish)),
-            ],
-        );
-        assert_eq!(code, EXIT_SUCCESS);
-        assert_eq!(lines, ["info Face recognized."]);
-        assert_eq!(scans, 1);
-    }
-
-    #[test]
-    fn repeated_triggers_start_repeated_scans() {
-        let (_, _, scans, _) = run(
-            &allow(),
-            FakeFace::default(),
-            vec![
-                (0, command(Command::Scan)),
-                (0, command(Command::Scan)),
-                (0, command(Command::Scan)),
-                (0, command(Command::Stop)),
-            ],
-        );
-        assert_eq!(scans, 3);
-    }
-
-    #[test]
-    fn face_after_password_with_deny() {
+    fn face_scan_during_the_wait() {
         let (code, lines, scans, elapsed) = run(
-            &deny(),
+            &allow(),
             FakeFace::default(),
             vec![
                 (0, command(Command::Finish)),
-                (0, command(Command::Answer(Answer::Trigger))),
+                (50, command(Command::Scan)),
                 (100, face(Outcome::Match)),
             ],
         );
         assert_eq!(code, EXIT_SUCCESS);
-        assert_eq!(lines, [ASK, "info Face recognized."]);
+        assert_eq!(lines, [INFO_WAIT, "info Face recognized."]);
         assert_eq!(scans, 1);
-        assert!(elapsed < Duration::from_millis(900), "{elapsed:?}");
-    }
-
-    #[test]
-    fn other_response_with_deny_rejects_at_once() {
-        let (code, lines, scans, elapsed) = run(
-            &deny(),
-            FakeFace::default(),
-            vec![
-                (0, command(Command::Finish)),
-                (0, command(Command::Answer(Answer::Other))),
-            ],
-        );
-        assert_eq!(code, EXIT_REJECT);
-        assert_eq!(lines, [ASK, "info A fingerprint or a face is necessary."]);
-        assert_eq!(scans, 0);
         assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
     }
 
     #[test]
-    fn face_without_a_match_waits_for_the_finger_until_the_timeout() {
+    fn reject_during_the_wait_fails_at_once() {
+        // A wrong finger.
         let (code, lines, _, elapsed) = run(
-            &deny(),
+            &allow(),
             FakeFace::default(),
             vec![
                 (0, command(Command::Finish)),
-                (0, command(Command::Answer(Answer::Trigger))),
-                (
-                    50,
-                    Input::Event(Event::Message("No face found.".to_owned())),
-                ),
+                (100, fingerprint(Outcome::Reject)),
+            ],
+        );
+        assert_eq!(code, EXIT_REJECT);
+        assert_eq!(lines, [INFO_WAIT, "info Not recognized."]);
+        assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+
+        // A face beyond the reject distance.
+        let (code, lines, _, elapsed) = run(
+            &allow(),
+            FakeFace::default(),
+            vec![
+                (0, command(Command::Finish)),
+                (100, message("Face not recognized.")),
+                (0, face(Outcome::Reject)),
+            ],
+        );
+        assert_eq!(code, EXIT_REJECT);
+        assert_eq!(
+            lines,
+            [
+                INFO_WAIT,
+                "info Face not recognized.",
+                "info Not recognized."
+            ]
+        );
+        assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+    }
+
+    #[test]
+    fn an_uncertain_face_during_the_wait_keeps_waiting() {
+        let (code, lines, _, elapsed) = run(
+            &allow(),
+            FakeFace::default(),
+            vec![
+                (0, command(Command::Finish)),
+                (100, message("Face not certain. Scan again.")),
                 (0, face(Outcome::NoDecision)),
             ],
         );
-        assert_eq!(code, EXIT_REJECT);
-        assert_eq!(
-            lines,
-            [
-                ASK,
-                "info No face found.",
-                "info A fingerprint or a face is necessary."
-            ]
-        );
+        assert_eq!(code, EXIT_NO_DECISION);
+        assert_eq!(lines, [INFO_WAIT, "info Face not certain. Scan again."]);
         assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
-    }
 
-    #[test]
-    fn face_only_decides_on_the_scan_result() {
-        let mut face_only = deny();
-        face_only.factors = vec![Factor::Face];
-        let (code, lines, _, elapsed) = run(
-            &face_only,
+        // A second scan in the wait can still match.
+        let (code, _, _, elapsed) = run(
+            &deny(),
             FakeFace::default(),
             vec![
                 (0, command(Command::Finish)),
-                (0, command(Command::Answer(Answer::Trigger))),
-                (50, face(Outcome::NoDecision)),
+                (100, face(Outcome::NoDecision)),
+                (300, face(Outcome::Match)),
             ],
         );
-        assert_eq!(code, EXIT_REJECT);
-        assert_eq!(lines.last().unwrap(), "info A face is necessary.");
+        assert_eq!(code, EXIT_SUCCESS);
         assert!(elapsed < Duration::from_millis(900), "{elapsed:?}");
     }
 
     #[test]
-    fn a_refused_scan_ends_without_a_wait() {
-        let refuse = FakeFace {
-            refuse: true,
-            ..FakeFace::default()
-        };
-        let (code, lines, scans, elapsed) = run(
-            &deny(),
-            refuse,
-            vec![
-                (0, command(Command::Finish)),
-                (0, command(Command::Answer(Answer::Trigger))),
-            ],
-        );
-        assert_eq!(code, EXIT_REJECT);
-        assert_eq!(
-            lines,
-            [
-                ASK,
-                "info The face scan did not start.",
-                "info A fingerprint or a face is necessary."
-            ]
-        );
-        assert_eq!(scans, 1);
-        assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
-    }
-
-    #[test]
-    fn wrong_finger_rejects_at_once() {
+    fn rejects_before_the_password_fail_at_once() {
         let (code, lines, _, elapsed) = run(
             &allow(),
             FakeFace::default(),
@@ -805,18 +682,12 @@ mod tests {
         assert_eq!(code, EXIT_REJECT);
         assert_eq!(lines, ["info Not recognized."]);
         assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
-    }
 
-    #[test]
-    fn face_reject_before_password_rejects() {
         let (code, lines, _, _) = run(
             &allow(),
             FakeFace::default(),
             vec![
-                (
-                    0,
-                    Input::Event(Event::Message("Face not recognized.".to_owned())),
-                ),
+                (0, message("Face not recognized.")),
                 (0, face(Outcome::Reject)),
                 (0, command(Command::Finish)),
             ],
@@ -840,59 +711,81 @@ mod tests {
     }
 
     #[test]
-    fn allow_waits_only_for_a_running_scan() {
-        let scanning = FakeFace {
-            scanning: true,
-            ..FakeFace::default()
-        };
-        let (code, lines, scans, elapsed) = run(
+    fn repeated_scans() {
+        let (_, _, scans, _) = run(
             &allow(),
-            scanning.clone(),
-            vec![(0, command(Command::Finish)), (100, face(Outcome::Match))],
-        );
-        assert_eq!(code, EXIT_SUCCESS);
-        assert_eq!(lines, ["info Face recognized."]);
-        assert_eq!(scans, 0);
-        assert!(elapsed < Duration::from_millis(900), "{elapsed:?}");
-
-        // A scan without a face ends the wait. The finger does not count
-        // any more: it cannot change PAM_IGNORE.
-        let (code, _, _, elapsed) = run(
-            &allow(),
-            scanning.clone(),
+            FakeFace::default(),
             vec![
-                (0, command(Command::Finish)),
-                (100, face(Outcome::NoDecision)),
+                (0, command(Command::Scan)),
+                (0, command(Command::Scan)),
+                (0, command(Command::Scan)),
+                (0, command(Command::Stop)),
             ],
         );
-        assert_eq!(code, EXIT_NO_DECISION);
-        assert!(elapsed < Duration::from_millis(900), "{elapsed:?}");
-
-        // Without a result, the wait ends at the timeout.
-        let (code, _, _, elapsed) = run(&allow(), scanning, vec![(0, command(Command::Finish))]);
-        assert_eq!(code, EXIT_NO_DECISION);
-        assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
+        assert_eq!(scans, 3);
     }
 
     #[test]
-    fn all_asks_for_the_missing_factor() {
+    fn a_refused_scan_says_so() {
+        let refuse = FakeFace {
+            refuse: true,
+            ..FakeFace::default()
+        };
+        let (_, lines, scans, _) = run(
+            &allow(),
+            refuse,
+            vec![(0, command(Command::Scan)), (0, command(Command::Stop))],
+        );
+        assert_eq!(lines, ["info The face scan did not start."]);
+        assert_eq!(scans, 1);
+    }
+
+    #[test]
+    fn without_the_face_factor_scans_do_nothing() {
+        let mut finger = allow();
+        finger.factors = vec![Factor::Fingerprint];
+        let (_, lines, scans, _) = run(
+            &finger,
+            FakeFace::default(),
+            vec![(0, command(Command::Scan)), (0, command(Command::Stop))],
+        );
+        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!(scans, 0);
+    }
+
+    #[test]
+    fn all_waits_for_the_missing_factor() {
         let all = settings(Combine::All, OnNoDecision::Allow);
-        let (code, lines, scans, _) = run(
+        let (code, lines, _, elapsed) = run(
             &all,
             FakeFace::default(),
             vec![
                 (0, fingerprint(Outcome::Match)),
                 (0, command(Command::Finish)),
-                (50, command(Command::Answer(Answer::Trigger))),
-                (50, face(Outcome::Match)),
+                (100, face(Outcome::Match)),
             ],
         );
         assert_eq!(code, EXIT_SUCCESS);
         assert_eq!(
             lines,
-            ["info Fingerprint recognized.", ASK, "info Face recognized."]
+            [
+                "info Fingerprint recognized.",
+                INFO_WAIT,
+                "info Face recognized."
+            ]
         );
-        assert_eq!(scans, 1);
+        assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+
+        let (code, lines, _, _) = run(
+            &all,
+            FakeFace::default(),
+            vec![
+                (0, fingerprint(Outcome::Match)),
+                (0, command(Command::Finish)),
+            ],
+        );
+        assert_eq!(code, EXIT_NO_DECISION);
+        assert_eq!(lines, ["info Fingerprint recognized.", INFO_WAIT]);
     }
 
     #[test]
@@ -902,13 +795,14 @@ mod tests {
             &all,
             FakeFace::default(),
             vec![
+                (0, fingerprint(Outcome::Match)),
                 (0, command(Command::Finish)),
-                (0, command(Command::Answer(Answer::Trigger))),
                 (50, face(Outcome::Reject)),
+                (0, face(Outcome::NoDecision)),
             ],
         );
         assert_eq!(code, EXIT_REJECT);
-        assert!(elapsed < Duration::from_millis(900), "{elapsed:?}");
+        assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
     }
 
     #[test]
@@ -916,14 +810,15 @@ mod tests {
         for end in [command(Command::Stop), Input::Closed] {
             let (code, _, _, _) = run(&deny(), FakeFace::default(), vec![(0, end.clone())]);
             assert_eq!(code, EXIT_NO_DECISION);
-            // An abort during the prompt of finish.
-            let (code, lines, _, _) = run(
+            // An abort during the wait of finish.
+            let (code, lines, _, elapsed) = run(
                 &deny(),
                 FakeFace::default(),
-                vec![(0, command(Command::Finish)), (0, end)],
+                vec![(0, command(Command::Finish)), (50, end)],
             );
             assert_eq!(code, EXIT_NO_DECISION);
-            assert_eq!(lines, [ASK]);
+            assert_eq!(lines, [INFO_WAIT]);
+            assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
         }
     }
 

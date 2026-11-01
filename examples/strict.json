@@ -3,7 +3,8 @@
   "defaults": {
     "combine": "all",
     "on_no_decision": "deny",
-    "finish_prompt": "Touch the fingerprint reader, then press Enter to scan your face: "
+    "timeout_seconds": 20,
+    "wait_message": "Touch the fingerprint reader and press Super+Alt+F (20 s)."
   },
   "services": {
     "login": { "factors": [] },

@@ -18,9 +18,13 @@ import pexpect
 def main():
     service, user, *steps = sys.argv[1:]
     output = io.StringIO()
+    # pamtester sets PAM_TTY only on request. The terminal is the pty that
+    # pexpect gives to pamtester, so that pam_biometrics.so finish can read
+    # trigger lines from it.
+    command = 'exec pamtester -I "tty=$(tty)" "$0" "$1" authenticate'
     child = pexpect.spawn(
-        "pamtester",
-        [service, user, "authenticate"],
+        "sh",
+        ["-c", command, service, user],
         encoding="utf-8",
         timeout=60,
     )

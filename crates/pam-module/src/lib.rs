@@ -21,15 +21,24 @@
 //! returns `PAM_IGNORE`. Without an enabled factor, `start` asks nothing
 //! and returns `PAM_IGNORE`.
 //!
-//! `finish` uses the session of `start`, or starts one. It shows the lines
-//! of the helper as information messages, asks the questions of the
-//! helper, and maps the exit code of the helper to the result:
+//! `finish` uses the session of `start`, or starts one. It never asks a
+//! question. It shows the lines of the helper as information messages while
+//! the helper waits for a decision, and maps the exit code of the helper to
+//! the result:
 //!
 //! | Exit status | Meaning             | Result         |
 //! |-------------|---------------------|----------------|
 //! | 0           | A match.            | `PAM_SUCCESS`  |
 //! | 10          | A reject.           | `PAM_AUTH_ERR` |
 //! | other       | No decision.        | `PAM_IGNORE`   |
+//!
+//! During the wait, `finish` also reads lines from `PAM_TTY` if it is a
+//! terminal in line mode (`ICANON`), for example under `login`, `sudo`, or
+//! `su`. A line equal to the face trigger starts a face scan. Other lines
+//! are discarded. The module opens the terminal read-only and non-blocking,
+//! never changes its settings, never reads it outside the wait or without
+//! `ICANON`, and closes it before `finish` returns. Nothing read from the
+//! terminal is used as a secret: a line only selects whether to scan.
 //!
 //! A crash of the helper or of this module gives no decision, so that a
 //! fault cannot lock the user out. The password stays necessary in the rest
@@ -43,10 +52,11 @@
 use std::ffi::{CStr, CString, OsStr, c_char, c_int, c_void};
 use std::io::{self, Read as _};
 use std::net::Shutdown;
-use std::os::fd::{AsRawFd as _, OwnedFd};
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::net::UnixStream;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
@@ -61,6 +71,7 @@ const PAM_AUTH_ERR: c_int = 7;
 const PAM_CONV_ERR: c_int = 19;
 const PAM_IGNORE: c_int = 25;
 const PAM_SERVICE: c_int = 1;
+const PAM_TTY: c_int = 3;
 const PAM_AUTHTOK: c_int = 6;
 const PAM_PROMPT_ECHO_OFF: c_int = 1;
 const PAM_TEXT_INFO: c_int = 4;
@@ -93,6 +104,36 @@ const TERM_GRACE: Duration = Duration::from_millis(500);
 
 /// The longest line from the helper.
 const MAX_LINE: usize = 64 * 1024;
+
+/// The longest line from the terminal that `finish` keeps.
+const MAX_TTY_LINE: usize = 4096;
+
+/// Returns a pollfd that waits for input on `fd`.
+const fn pollfd(fd: RawFd) -> libc::pollfd {
+    libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    }
+}
+
+/// Waits up to `timeout` milliseconds, or without a limit for -1, for one of
+/// `descriptors`. Returns the number of ready descriptors. Repeats after a
+/// signal.
+fn poll(descriptors: &mut [libc::pollfd], timeout: c_int) -> io::Result<usize> {
+    let count = libc::nfds_t::try_from(descriptors.len()).unwrap_or(libc::nfds_t::MAX);
+    loop {
+        // SAFETY: `descriptors` holds `count` valid pollfd structures.
+        let ready = unsafe { libc::poll(descriptors.as_mut_ptr(), count, timeout) };
+        if let Ok(ready) = usize::try_from(ready) {
+            return Ok(ready);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
 
 /// The opaque `pam_handle_t`.
 #[repr(C)]
@@ -279,7 +320,6 @@ enum Message<'a> {
     Trigger(&'a [u8]),
     Ready,
     Info(&'a [u8]),
-    Ask(&'a [u8]),
     Unknown,
 }
 
@@ -296,10 +336,142 @@ impl<'a> Message<'a> {
             b"trigger" => Self::Trigger(text),
             b"ready" => Self::Ready,
             b"info" => Self::Info(text),
-            b"ask" => Self::Ask(text),
             _ => Self::Unknown,
         }
     }
+}
+
+/// Returns the device of a `PAM_TTY` value: `/dev/NAME` for a relative name
+/// such as `tty1` or `pts/3`, or the value itself if it is under `/dev/`.
+/// Returns `None` for an X display such as `:0` and for other paths.
+fn tty_path(item: &[u8]) -> Option<PathBuf> {
+    if item.is_empty() || item.contains(&b':') {
+        return None;
+    }
+    let path = if item.starts_with(b"/dev/") {
+        item.to_vec()
+    } else if item.starts_with(b"/") {
+        return None;
+    } else {
+        [b"/dev/", item].concat()
+    };
+    if path.split(|byte| *byte == b'/').any(|part| part == b"..") {
+        return None;
+    }
+    Some(PathBuf::from(OsStr::from_bytes(&path)))
+}
+
+/// Removes the complete lines from `pending` and returns them without the
+/// line end. Drops a partial line that grows beyond [`MAX_TTY_LINE`].
+fn take_lines(pending: &mut Vec<u8>) -> Vec<Vec<u8>> {
+    let mut lines = Vec::new();
+    while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+        let mut line: Vec<u8> = pending.drain(..=end).collect();
+        line.pop();
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        lines.push(line);
+    }
+    if pending.len() > MAX_TTY_LINE {
+        pending.clear();
+    }
+    lines
+}
+
+/// The terminal of the application in line mode. `finish` reads trigger
+/// lines from it during the wait. Dropping it closes the descriptor.
+#[derive(Debug)]
+struct Tty {
+    fd: OwnedFd,
+    pending: Vec<u8>,
+}
+
+impl Tty {
+    /// Opens `path` read-only and non-blocking. Returns `None` unless it is
+    /// a character device with a terminal in line mode. Discards the input
+    /// that waits already, so that only lines from the wait count.
+    fn open(path: &Path) -> Option<Self> {
+        let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+        // SAFETY: `path` is a C string. The flags open no controlling
+        // terminal and do not block.
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: `open` returned a new descriptor that nothing else owns.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `status` has room for a stat structure.
+        if unsafe { libc::fstat(fd.as_raw_fd(), status.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        // SAFETY: `fstat` filled the structure.
+        if unsafe { status.assume_init() }.st_mode & libc::S_IFMT != libc::S_IFCHR {
+            return None;
+        }
+        let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: `termios` has room for a termios structure.
+        if unsafe { libc::tcgetattr(fd.as_raw_fd(), termios.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        // SAFETY: `tcgetattr` filled the structure.
+        if unsafe { termios.assume_init() }.c_lflag & libc::ICANON == 0 {
+            return None;
+        }
+        let mut tty = Self {
+            fd,
+            pending: Vec::new(),
+        };
+        tty.read_lines().ok()?;
+        tty.pending.clear();
+        Some(tty)
+    }
+
+    /// Reads the input that waits and returns the complete lines.
+    fn read_lines(&mut self) -> io::Result<Vec<Vec<u8>>> {
+        let mut chunk = [0_u8; 1024];
+        loop {
+            // SAFETY: `chunk` is valid for its length.
+            let count =
+                unsafe { libc::read(self.fd.as_raw_fd(), chunk.as_mut_ptr().cast(), chunk.len()) };
+            match usize::try_from(count) {
+                // The end-of-file character, or no more input.
+                Ok(0) => break,
+                Ok(count) => self.pending.extend_from_slice(&chunk[..count]),
+                Err(_) => {
+                    let error = io::Error::last_os_error();
+                    match error.kind() {
+                        io::ErrorKind::WouldBlock => break,
+                        io::ErrorKind::Interrupted => {}
+                        _ => return Err(error),
+                    }
+                }
+            }
+        }
+        Ok(take_lines(&mut self.pending))
+    }
+}
+
+/// Opens the terminal of the application, if it is one in line mode.
+///
+/// # Safety
+///
+/// `pamh` must be valid.
+unsafe fn terminal(pamh: *mut PamHandle) -> Option<Tty> {
+    let mut item: *const c_void = std::ptr::null();
+    // SAFETY: `pamh` is valid. PAM_TTY is a C string that PAM owns.
+    if unsafe { pam_get_item(pamh, PAM_TTY, &raw mut item) } != PAM_SUCCESS || item.is_null() {
+        return None;
+    }
+    // SAFETY: PAM_TTY is a C string.
+    let item = unsafe { CStr::from_ptr(item.cast()) }.to_bytes();
+    Tty::open(&tty_path(item)?)
 }
 
 /// Returns the command that runs the helper.
@@ -390,7 +562,7 @@ impl Session {
                 Message::Reprompt(text) => reprompt = CString::new(text).ok(),
                 Message::Trigger(text) => session.greeting.trigger = Some(text.to_vec()),
                 Message::Ready => break,
-                Message::Info(_) | Message::Ask(_) | Message::Unknown => {}
+                Message::Info(_) | Message::Unknown => {}
             }
         }
         match (prompt, reprompt) {
@@ -403,16 +575,37 @@ impl Session {
         }
     }
 
+    /// Removes the next complete line from the buffer.
+    fn buffered_line(&mut self) -> Option<Vec<u8>> {
+        let end = self.buffer.iter().position(|byte| *byte == b'\n')?;
+        let mut line: Vec<u8> = self.buffer.drain(..=end).collect();
+        line.pop();
+        Some(line)
+    }
+
+    /// Reads what the helper sent into the buffer. The end of the stream is
+    /// an error.
+    fn fill(&mut self) -> io::Result<()> {
+        if self.buffer.len() > MAX_LINE {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
+        }
+        let mut chunk = [0; 4096];
+        match (&self.stream).read(&mut chunk) {
+            Ok(0) => Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(count) => {
+                self.buffer.extend_from_slice(&chunk[..count]);
+                Ok(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Reads one line. Returns `None` if `deadline` passes first.
     fn read_line(&mut self, deadline: Option<Instant>) -> io::Result<Option<Vec<u8>>> {
         loop {
-            if let Some(end) = self.buffer.iter().position(|byte| *byte == b'\n') {
-                let mut line: Vec<u8> = self.buffer.drain(..=end).collect();
-                line.pop();
+            if let Some(line) = self.buffered_line() {
                 return Ok(Some(line));
-            }
-            if self.buffer.len() > MAX_LINE {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
             }
             let timeout = match deadline {
                 None => -1,
@@ -421,30 +614,11 @@ impl Session {
                     c_int::try_from(remaining.as_millis()).unwrap_or(c_int::MAX)
                 }
             };
-            let mut descriptor = libc::pollfd {
-                fd: self.stream.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: `descriptor` is one valid pollfd.
-            let ready = unsafe { libc::poll(&raw mut descriptor, 1, timeout) };
-            if ready < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(error);
-            }
-            if ready == 0 {
+            let mut descriptors = [pollfd(self.stream.as_raw_fd())];
+            if poll(&mut descriptors, timeout)? == 0 {
                 return Ok(None);
             }
-            let mut chunk = [0; 4096];
-            match (&self.stream).read(&mut chunk) {
-                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
-                Ok(count) => self.buffer.extend_from_slice(&chunk[..count]),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
-            }
+            self.fill()?;
         }
     }
 
@@ -511,33 +685,54 @@ impl Session {
         }
     }
 
-    /// Lets the helper decide after the password module. Returns the exit
-    /// status of the helper, or the PAM result of a conversation error.
-    fn finish(&mut self, conversation: &mut dyn Conversation) -> Result<ExitStatus, c_int> {
+    /// Lets the helper wait for a decision after the password module, and
+    /// shows its lines meanwhile. A trigger line on `tty` starts a face
+    /// scan. Returns the exit status of the helper.
+    fn finish(
+        &mut self,
+        conversation: &mut dyn Conversation,
+        mut tty: Option<Tty>,
+    ) -> io::Result<ExitStatus> {
         self.send(b"finish\n");
-        while let Ok(Some(line)) = self.read_line(None) {
-            match Message::parse(&line) {
-                Message::Info(text) => conversation.info(text),
-                Message::Ask(text) => {
-                    let Some(response) = CString::new(text)
-                        .ok()
-                        .and_then(|prompt| conversation.ask(&prompt))
-                    else {
-                        return Err(PAM_CONV_ERR);
-                    };
-                    if is_trigger(self.greeting.trigger.as_deref(), response.bytes()) {
-                        drop(response);
-                        conversation.info(SCANNING);
-                        self.send(b"answer trigger\n");
-                    } else {
-                        drop(response);
-                        self.send(b"answer other\n");
-                    }
+        loop {
+            while let Some(line) = self.buffered_line() {
+                if let Message::Info(text) = Message::parse(&line) {
+                    conversation.info(text);
                 }
-                _ => {}
+            }
+            let mut descriptors = [
+                pollfd(self.stream.as_raw_fd()),
+                // poll ignores a negative descriptor.
+                pollfd(tty.as_ref().map_or(-1, |tty| tty.fd.as_raw_fd())),
+            ];
+            match poll(&mut descriptors, -1) {
+                Ok(_) => {}
+                Err(_) => break,
+            }
+            let [helper, terminal] = descriptors;
+            if terminal.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                tty = None;
+            } else if terminal.revents & libc::POLLIN != 0
+                && let Some(open) = tty.as_mut()
+            {
+                match open.read_lines() {
+                    Ok(lines) => {
+                        for line in lines {
+                            if is_trigger(self.greeting.trigger.as_deref(), &line) {
+                                conversation.info(SCANNING);
+                                self.send(b"scan\n");
+                            }
+                        }
+                    }
+                    Err(_) => tty = None,
+                }
+            }
+            if helper.revents != 0 && self.fill().is_err() {
+                break;
             }
         }
-        self.child.wait().map_err(|_| PAM_IGNORE)
+        drop(tty);
+        self.child.wait()
     }
 
     /// Waits up to `timeout` for the helper to end. Returns true if it
@@ -709,7 +904,15 @@ unsafe fn authenticate(pamh: *mut PamHandle, argc: c_int, argv: *const *const c_
             let Some(session) = session else {
                 return PAM_IGNORE;
             };
-            let result = match session.finish(&mut conversation) {
+            // Only a face trigger can come from the terminal.
+            let tty = session
+                .greeting
+                .trigger
+                .is_some()
+                // SAFETY: `pamh` is valid.
+                .then(|| unsafe { terminal(pamh) })
+                .flatten();
+            let result = match session.finish(&mut conversation, tty) {
                 Ok(status) => {
                     let result = pam_result(status.code());
                     if result == PAM_IGNORE {
@@ -721,7 +924,10 @@ unsafe fn authenticate(pamh: *mut PamHandle, argc: c_int, argv: *const *const c_
                     }
                     result
                 }
-                Err(result) => result,
+                Err(error) => {
+                    log(pamh, LOG_ERR, &format!("waitpid: {error}"));
+                    PAM_IGNORE
+                }
             };
             // SAFETY: `pamh` is valid. `session` is no longer used.
             unsafe { remove(pamh) };
@@ -925,7 +1131,8 @@ mod tests {
             Message::parse(b"info Face recognized."),
             Message::Info(b"Face recognized.")
         );
-        assert_eq!(Message::parse(b"ask Touch: "), Message::Ask(b"Touch: "));
+        // `finish` asks nothing, so `ask` is not a message any more.
+        assert_eq!(Message::parse(b"ask Touch: "), Message::Unknown);
         assert_eq!(Message::parse(b"state pending idle"), Message::Unknown);
         assert_eq!(Message::parse(b""), Message::Unknown);
     }
@@ -1046,59 +1253,192 @@ mod tests {
         assert_eq!(script.password, None);
     }
 
+    /// A pseudo terminal. The test types on the master end.
+    struct Pty {
+        master: OwnedFd,
+        slave: OwnedFd,
+        path: PathBuf,
+    }
+
+    impl Pty {
+        fn new() -> Self {
+            let (mut master, mut slave) = (0, 0);
+            // SAFETY: openpty writes two descriptors. Null pointers leave
+            // the name, the settings, and the size alone.
+            let result = unsafe {
+                libc::openpty(
+                    &raw mut master,
+                    &raw mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            };
+            assert_eq!(result, 0, "{}", io::Error::last_os_error());
+            // SAFETY: openpty returned two new descriptors.
+            let (master, slave) =
+                unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+            let path = std::fs::read_link(format!("/proc/self/fd/{}", slave.as_raw_fd())).unwrap();
+            Self {
+                master,
+                slave,
+                path,
+            }
+        }
+
+        fn type_text(&self, text: &[u8]) {
+            // SAFETY: `text` is valid for its length.
+            let written =
+                unsafe { libc::write(self.master.as_raw_fd(), text.as_ptr().cast(), text.len()) };
+            assert_eq!(usize::try_from(written).unwrap(), text.len());
+        }
+
+        fn set_line_mode(&self, on: bool) {
+            let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+            // SAFETY: tcgetattr fills the structure, tcsetattr reads it.
+            unsafe {
+                assert_eq!(
+                    libc::tcgetattr(self.slave.as_raw_fd(), termios.as_mut_ptr()),
+                    0
+                );
+                let mut termios = termios.assume_init();
+                if on {
+                    termios.c_lflag |= libc::ICANON;
+                } else {
+                    termios.c_lflag &= !libc::ICANON;
+                }
+                assert_eq!(
+                    libc::tcsetattr(self.slave.as_raw_fd(), libc::TCSANOW, &raw const termios),
+                    0
+                );
+            }
+        }
+    }
+
+    /// Reads lines from `tty` until `count` lines or 5 s.
+    fn tty_lines(tty: &mut Tty, count: usize) -> Vec<Vec<u8>> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut lines = Vec::new();
+        while lines.len() < count && Instant::now() < deadline {
+            let mut descriptors = [pollfd(tty.fd.as_raw_fd())];
+            poll(&mut descriptors, 100).unwrap();
+            lines.extend(tty.read_lines().unwrap());
+        }
+        lines
+    }
+
     #[test]
-    fn finish_relays_and_answers() {
+    fn tty_paths() {
+        assert_eq!(tty_path(b"tty1"), Some(PathBuf::from("/dev/tty1")));
+        assert_eq!(tty_path(b"pts/3"), Some(PathBuf::from("/dev/pts/3")));
+        assert_eq!(tty_path(b"/dev/pts/3"), Some(PathBuf::from("/dev/pts/3")));
+        for item in [
+            &b""[..],
+            b":0",
+            b"/etc/passwd",
+            b"/dev/../etc/passwd",
+            b"../etc/passwd",
+            b"pts/../../etc/passwd",
+        ] {
+            assert_eq!(tty_path(item), None, "{}", String::from_utf8_lossy(item));
+        }
+    }
+
+    #[test]
+    fn lines_split() {
+        let mut pending = b"x\n\r\n\nab".to_vec();
+        assert_eq!(take_lines(&mut pending), [&b"x"[..], b"", b""]);
+        assert_eq!(pending, b"ab");
+        pending.extend_from_slice(b"c\n");
+        assert_eq!(take_lines(&mut pending), [&b"abc"[..]]);
+        // A partial line beyond the limit is dropped.
+        let mut long = vec![b'a'; MAX_TTY_LINE + 1];
+        assert!(take_lines(&mut long).is_empty());
+        assert!(long.is_empty());
+    }
+
+    #[test]
+    fn tty_reads_lines_in_line_mode() {
+        let pty = Pty::new();
+        // Input from before the wait does not count.
+        pty.type_text(b"stale\n");
+        std::thread::sleep(Duration::from_millis(200));
+        let mut tty = Tty::open(&pty.path).expect("a terminal in line mode");
+        assert!(tty.read_lines().unwrap().is_empty());
+        pty.type_text(b"x\n\n");
+        assert_eq!(tty_lines(&mut tty, 2), [&b"x"[..], b""]);
+    }
+
+    #[test]
+    fn tty_without_line_mode_or_a_terminal_is_not_read() {
+        let pty = Pty::new();
+        pty.set_line_mode(false);
+        assert!(Tty::open(&pty.path).is_none());
+        pty.set_line_mode(true);
+        assert!(Tty::open(&pty.path).is_some());
+        // A character device that is not a terminal.
+        assert!(Tty::open(Path::new("/dev/null")).is_none());
+        // A regular file, and a missing file.
+        assert!(Tty::open(Path::new("/proc/self/status")).is_none());
+        assert!(Tty::open(Path::new("/dev/pam-biometrics-missing")).is_none());
+    }
+
+    #[test]
+    fn tty_trigger_during_the_wait_starts_a_scan() {
         let script = format!(
             r#"{GREETING}
+read -r command; echo "info got $command"; echo 'info Wait.'
 read -r command; echo "info got $command"
-echo 'info Fingerprint recognized.'
-echo 'ask Touch the fingerprint reader, or press Enter to scan your face: '
-read -r answer; echo "info got $answer"
 exit 0"#
         );
         let mut session = start_helper(&script);
-        let mut conversation = Script::new(&[""]);
-        let status = session.finish(&mut conversation).unwrap();
+        let pty = Pty::new();
+        let tty = Tty::open(&pty.path).expect("a terminal in line mode");
+        let typist = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            // Lines other than the trigger do nothing.
+            pty.type_text(b"hello\n");
+            std::thread::sleep(Duration::from_millis(100));
+            pty.type_text(b"\n");
+            // Keep the terminal open until the helper ends.
+            std::thread::sleep(Duration::from_secs(2));
+        });
+        let mut conversation = Script::new(&[]);
+        let status = session.finish(&mut conversation, Some(tty)).unwrap();
         assert_eq!(pam_result(status.code()), PAM_SUCCESS);
         assert_eq!(
             conversation.infos,
-            [
-                "got finish",
-                "Fingerprint recognized.",
-                "Scanning face…",
-                "got answer trigger"
-            ]
+            ["got finish", "Wait.", "Scanning face…", "got scan"]
         );
-        assert_eq!(
-            conversation.prompts,
-            ["Touch the fingerprint reader, or press Enter to scan your face: "]
-        );
+        assert!(conversation.prompts.is_empty());
+        drop(typist);
     }
 
     #[test]
-    fn finish_other_response_and_reject() {
+    fn finish_relays_and_maps_the_exit_code() {
         let script = format!(
-            r#"{GREETING}; read -r command; echo 'ask Press Enter: '; read -r answer
-echo "info got $answer"; echo 'info Not recognized.'; exit 10"#
+            r"{GREETING}; read -r command; echo 'info Wait.'; sleep 0.2
+echo 'info Face not recognized.'; echo 'info Not recognized.'; exit 10"
         );
         let mut session = start_helper(&script);
-        let mut conversation = Script::new(&["no"]);
-        let status = session.finish(&mut conversation).unwrap();
+        let mut conversation = Script::new(&[]);
+        let status = session.finish(&mut conversation, None).unwrap();
         assert_eq!(pam_result(status.code()), PAM_AUTH_ERR);
-        assert_eq!(conversation.infos, ["got answer other", "Not recognized."]);
+        assert_eq!(
+            conversation.infos,
+            ["Wait.", "Face not recognized.", "Not recognized."]
+        );
+        assert!(conversation.prompts.is_empty());
+
+        let mut session = start_helper(&format!("{GREETING}; read -r command; exit 20"));
+        let status = session.finish(&mut Script::new(&[]), None).unwrap();
+        assert_eq!(pam_result(status.code()), PAM_IGNORE);
     }
 
     #[test]
-    fn finish_conversation_error_and_crash() {
-        let script = format!("{GREETING}; read -r command; echo 'ask Press Enter: '; {ECHO}");
-        let mut session = start_helper(&script);
-        assert_eq!(
-            session.finish(&mut Script::new(&[])).unwrap_err(),
-            PAM_CONV_ERR
-        );
-
+    fn finish_after_a_crash_gives_no_decision() {
         let mut session = start_helper(&format!("{GREETING}; read -r command; kill -9 $$"));
-        let status = session.finish(&mut Script::new(&[])).unwrap();
+        let status = session.finish(&mut Script::new(&[]), None).unwrap();
         assert_eq!(pam_result(status.code()), PAM_IGNORE);
     }
 

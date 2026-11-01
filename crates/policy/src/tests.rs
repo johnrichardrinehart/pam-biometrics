@@ -21,7 +21,7 @@ fn built_in_defaults() {
     assert_eq!(settings.on_no_decision, OnNoDecision::Allow);
     assert_eq!(settings.timeout_seconds, 15);
     assert_eq!(settings.password_prompt, None);
-    assert_eq!(settings.finish_prompt, None);
+    assert_eq!(settings.wait_message, None);
     assert_eq!(settings.fingerprint.max_tries, 3);
     assert!((settings.face.match_distance - 0.45).abs() < f64::EPSILON);
     assert!((settings.face.reject_distance - 0.6).abs() < f64::EPSILON);
@@ -119,7 +119,7 @@ fn prompts_and_trigger_resolve() {
           "version": 1,
           "defaults": { "password_prompt": "Password or Enter: " },
           "services": {
-            "greetd": { "finish_prompt": "Press Enter.", "face": { "trigger": "f" } }
+            "greetd": { "wait_message": "Press Super+Alt+F.", "face": { "trigger": "f" } }
           },
           "users": { "alice": { "services": { "greetd": { "face": { "trigger": "" } } } } }
         }"#,
@@ -127,14 +127,14 @@ fn prompts_and_trigger_resolve() {
     .unwrap();
     let sudo = policy.resolve(Some("sudo"), None);
     assert_eq!(sudo.password_prompt.as_deref(), Some("Password or Enter: "));
-    assert_eq!(sudo.finish_prompt, None);
+    assert_eq!(sudo.wait_message, None);
     assert_eq!(sudo.face.trigger, "");
     let greetd = policy.resolve(Some("greetd"), Some("bob"));
     assert_eq!(
         greetd.password_prompt.as_deref(),
         Some("Password or Enter: ")
     );
-    assert_eq!(greetd.finish_prompt.as_deref(), Some("Press Enter."));
+    assert_eq!(greetd.wait_message.as_deref(), Some("Press Super+Alt+F."));
     assert_eq!(greetd.face.trigger, "f");
     // The trigger merges like the other face fields.
     assert!((greetd.face.match_distance - 0.45).abs() < f64::EPSILON);
@@ -156,8 +156,10 @@ fn unknown_fields_are_errors() {
         r#"{"version": 1, "defaults": {"factors": ["iris"]}}"#,
         r#"{"version": 1, "defaults": {"combine": "first"}}"#,
         r#"{"version": 1, "defaults": {"on_no_decision": "ignore"}}"#,
-        // `finish_prompt` replaced `prompt`.
+        // `password_prompt` and `wait_message` replaced `prompt`, and
+        // `finish` has no prompt.
         r#"{"version": 1, "defaults": {"prompt": "Touch the reader."}}"#,
+        r#"{"version": 1, "defaults": {"finish_prompt": "Press Enter: "}}"#,
         r#"{"version": 1, "defaults": {"face": {"trigger": null}}}"#,
     ] {
         assert!(
@@ -204,12 +206,12 @@ fn layer_values_are_checked() {
             "test: defaults: password_prompt must contain text",
         ),
         (
-            r#"{"version": 1, "services": {"sudo": {"finish_prompt": ""}}}"#,
-            "test: services.sudo: finish_prompt must contain text",
+            r#"{"version": 1, "services": {"sudo": {"wait_message": ""}}}"#,
+            "test: services.sudo: wait_message must contain text",
         ),
         (
-            r#"{"version": 1, "defaults": {"finish_prompt": "Touch\nthe reader: "}}"#,
-            "test: defaults: finish_prompt must not contain control characters",
+            r#"{"version": 1, "defaults": {"wait_message": "Touch\nthe reader."}}"#,
+            "test: defaults: wait_message must not contain control characters",
         ),
         (
             r#"{"version": 1, "defaults": {"face": {"trigger": "f\r"}}}"#,

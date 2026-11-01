@@ -110,7 +110,7 @@ pub fn evaluate(
         ScanResult::Finished { best, faces } => Some(match face.classify(*best, *faces) {
             FaceClass::Match => (Outcome::Match, None),
             FaceClass::Reject => (Outcome::Reject, Some("Face not recognized.")),
-            FaceClass::Uncertain => (Outcome::NoDecision, Some("Face not certain.")),
+            FaceClass::Uncertain => (Outcome::NoDecision, Some("Face not certain. Scan again.")),
             FaceClass::Absent => (Outcome::NoDecision, Some("No face found.")),
         }),
     }
@@ -292,7 +292,7 @@ mod tests {
         );
         assert_eq!(
             evaluate(&face, &finished(Some(0.5), 3)),
-            Some((Outcome::NoDecision, Some("Face not certain.")))
+            Some((Outcome::NoDecision, Some("Face not certain. Scan again.")))
         );
         assert_eq!(
             evaluate(&face, &finished(None, 0)),

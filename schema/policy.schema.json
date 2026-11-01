@@ -67,7 +67,7 @@
           "enum": ["allow", "deny"]
         },
         "timeout_seconds": {
-          "description": "Maximum time that finish waits for the factors after the password.",
+          "description": "Time that finish waits for a fingerprint or a face after the password, from the start of finish. Without a decision at the end, on_no_decision applies.",
           "type": "integer",
           "minimum": 1,
           "maximum": 4294967295
@@ -77,8 +77,8 @@
           "$ref": "#/$defs/line",
           "pattern": "\\S"
         },
-        "finish_prompt": {
-          "description": "The prompt of finish after the password. The default depends on the factors and face.trigger.",
+        "wait_message": {
+          "description": "The information line that finish shows when it waits. The default depends on the factors, face.trigger, and timeout_seconds.",
           "$ref": "#/$defs/line",
           "pattern": "\\S"
         },
@@ -115,7 +115,7 @@
               "maximum": 4294967295
             },
             "trigger": {
-              "description": "The response to a prompt that starts a face scan. The empty text stands for Enter alone.",
+              "description": "The response to the password prompt of start, or a line typed on a line-mode terminal during the wait of finish, that starts a face scan. The empty text stands for Enter alone.",
               "$ref": "#/$defs/line"
             }
           }

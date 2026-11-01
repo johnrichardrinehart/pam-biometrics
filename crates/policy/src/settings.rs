@@ -94,10 +94,11 @@ pub struct Settings {
     /// depends on the factors and the face trigger.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password_prompt: Option<String>,
-    /// The prompt of `finish` after the password. `None` gives a text that
-    /// depends on the factors and the face trigger.
+    /// The information line that `finish` shows when it waits for the
+    /// factors. `None` gives a text that depends on the factors, the face
+    /// trigger, and the timeout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub finish_prompt: Option<String>,
+    pub wait_message: Option<String>,
     /// Fingerprint settings.
     pub fingerprint: FingerprintSettings,
     /// Face settings.
@@ -112,7 +113,7 @@ impl Default for Settings {
             on_no_decision: OnNoDecision::Allow,
             timeout_seconds: 15,
             password_prompt: None,
-            finish_prompt: None,
+            wait_message: None,
             fingerprint: FingerprintSettings { max_tries: 3 },
             face: FaceSettings {
                 match_distance: 0.45,
@@ -142,8 +143,8 @@ impl Settings {
         if let Some(prompt) = &layer.password_prompt {
             self.password_prompt = Some(prompt.clone());
         }
-        if let Some(prompt) = &layer.finish_prompt {
-            self.finish_prompt = Some(prompt.clone());
+        if let Some(message) = &layer.wait_message {
+            self.wait_message = Some(message.clone());
         }
         if let Some(fingerprint) = &layer.fingerprint
             && let Some(max_tries) = fingerprint.max_tries
@@ -222,13 +223,13 @@ pub struct Layer {
         skip_serializing_if = "Option::is_none"
     )]
     pub password_prompt: Option<String>,
-    /// See [`Settings::finish_prompt`].
+    /// See [`Settings::wait_message`].
     #[serde(
         default,
         deserialize_with = "present",
         skip_serializing_if = "Option::is_none"
     )]
-    pub finish_prompt: Option<String>,
+    pub wait_message: Option<String>,
     /// See [`Settings::fingerprint`].
     #[serde(
         default,

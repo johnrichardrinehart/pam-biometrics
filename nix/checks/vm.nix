@@ -83,11 +83,17 @@ testers.runNixOSTest {
         scanSeconds = 6;
         enrollSeconds = 10;
         policy = {
-          defaults.timeout_seconds = 15;
+          # Missing biometrics delay each attempt by this much.
+          defaults.timeout_seconds = 3;
           services = {
             test-deny.on_no_decision = "deny";
             test-none.factors = [ ];
-            test-trigger.face.trigger = "f";
+            # Long enough for a full scan of a stranger.
+            test-scan.timeout_seconds = 15;
+            test-trigger = {
+              face.trigger = "f";
+              timeout_seconds = 15;
+            };
             test-rescan.timeout_seconds = 40;
           };
         };
@@ -102,6 +108,7 @@ testers.runNixOSTest {
             "test-own"
             "test-deny"
             "test-none"
+            "test-scan"
             "test-trigger"
             "test-rescan"
           ]
@@ -132,7 +139,7 @@ testers.runNixOSTest {
     machine.wait_for_file("/run/pam-biometrics/socket")
 
     PROMPT = "?Password (Enter to scan face): "
-    FINISH = "?Touch the fingerprint reader, or press Enter to scan your face: "
+    WAIT = "Touch the fingerprint reader or press Enter to scan your face"
     PASSWORD = "!alice-password"
 
 
@@ -226,11 +233,14 @@ testers.runNixOSTest {
         machine.succeed("pam-biometrics face scan alice")
         output = machine.succeed("pam-biometrics face wait alice")
         assert output.strip() == "Face: recognized", output
-        # pam_unix asks for the password itself.
-        status, output, _ = converse("test-finish", "?Password: ", PASSWORD)
+        # pam_unix asks for the password itself. The stored match decides
+        # at once, without the wait message.
+        status, output, elapsed = converse("test-finish", "?Password: ", PASSWORD)
         assert status == 0, output
         assert "Face recognized." in output, output
+        assert WAIT not in output, output
         assert "successfully authenticated" in output, output
+        assert elapsed < 3, elapsed
         # The step consumed the result.
         assert machine.succeed("pam-biometrics face status alice").strip() == ""
 
@@ -238,31 +248,49 @@ testers.runNixOSTest {
         output = machine.succeed("runuser -u alice -- pam-biometrics face verify")
         assert "Verify result: verify-match (done)" in output, output
 
-    with subtest("the password alone gives success at once"):
+    with subtest("the password alone waits, then passes with allow"):
         status, output, elapsed = converse("test-own", PROMPT, PASSWORD)
         assert status == 0, output
+        assert WAIT + " (3 s)." in output, output
         assert "successfully authenticated" in output, output
-        assert "Touch" not in output, output
-        assert elapsed < 5, elapsed
+        assert elapsed >= 3, elapsed
 
-    with subtest("a wrong password fails and stops the helper"):
-        status, output, _ = converse("test-own", PROMPT, "!wrong-password")
+    with subtest("the password alone waits, then fails with deny"):
+        status, output, elapsed = converse("test-deny", PROMPT, PASSWORD)
         assert status == 1, output
+        assert WAIT + " (3 s)." in output, output
+        assert "A fingerprint or a face is necessary." in output, output
+        assert "Authentication failure" in output, output
+        assert elapsed >= 3, elapsed
+
+    with subtest("a wrong password fails at once and stops the helper"):
+        status, output, elapsed = converse("test-own", PROMPT, "!wrong-password")
+        assert status == 1, output
+        assert WAIT not in output, output
         assert "Authentication failure" in output, output
 
     with subtest("Enter scans the face before the password"):
         status, output, _ = converse(
-            "test-own", PROMPT, "!", "?Scanning face", "?Password: ", PASSWORD
+            "test-scan", PROMPT, "!", "?Scanning face", "?Password: ", PASSWORD
         )
         assert status == 0, output
         assert "Face recognized." in output, output
         assert "successfully authenticated" in output, output
         assert machine.succeed("pam-biometrics face status alice").strip() == ""
 
-    with subtest("a stranger gives AUTH_ERR"):
+    with subtest("Enter on the terminal during the wait scans the face"):
+        status, output, _ = converse(
+            "test-scan", PROMPT, PASSWORD, "?" + WAIT + " (15 s).", "!"
+        )
+        assert status == 0, output
+        assert "Scanning face" in output, output
+        assert "Face recognized." in output, output
+        assert "successfully authenticated" in output, output
+
+    with subtest("a stranger before the password gives AUTH_ERR"):
         show("${images.biden-top}")
         status, output, _ = converse(
-            "test-own", PROMPT, "!", "?Scanning face", "?Password: ", PASSWORD
+            "test-scan", PROMPT, "!", "?Scanning face", "?Password: ", PASSWORD
         )
         assert status == 1, output
         assert "Face not recognized." in output, output
@@ -270,29 +298,35 @@ testers.runNixOSTest {
         assert "Authentication failure" in output, output
         machine.fail("runuser -u alice -- pam-biometrics face verify")
 
-    with subtest("deny asks after the password, and Enter scans the face"):
-        show("${images.obama2}")
-        status, output, _ = converse("test-deny", PROMPT, PASSWORD, FINISH, "!")
-        assert status == 0, output
-        assert "Scanning face" in output, output
-        assert "Face recognized." in output, output
-        assert "successfully authenticated" in output, output
-
-    with subtest("deny fails without a factor"):
-        status, output, _ = converse("test-deny", PROMPT, PASSWORD, FINISH, "!no")
+    with subtest("a stranger during the wait gives AUTH_ERR"):
+        status, output, elapsed = converse(
+            "test-scan", PROMPT, PASSWORD, "?" + WAIT + " (15 s).", "!"
+        )
         assert status == 1, output
-        assert "Scanning face" not in output, output
-        assert "A fingerprint or a face is necessary." in output, output
+        assert "Scanning face" in output, output
+        assert "Face not recognized." in output, output
+        assert "Not recognized." in output, output
         assert "Authentication failure" in output, output
+        # The reject ends the wait before the timeout.
+        assert elapsed < 15, elapsed
 
-    with subtest("a custom trigger scans the face"):
+    with subtest("a custom trigger scans the face before or during the wait"):
+        show("${images.obama2}")
         trigger_prompt = "?Password (type f to scan face): "
+        trigger_wait = "?Touch the fingerprint reader or type f to scan your face (15 s)."
         status, output, _ = converse(
             "test-trigger", trigger_prompt, "!f", "?Scanning face", "?Password: ", PASSWORD
         )
         assert status == 0, output
         assert "Face recognized." in output, output
-        # Enter alone is a password here.
+        status, output, _ = converse(
+            "test-trigger", trigger_prompt, PASSWORD, trigger_wait, "!", "!f"
+        )
+        assert status == 0, output
+        # Enter alone is not the trigger here.
+        assert output.count("Scanning face") == 1, output
+        assert "Face recognized." in output, output
+        # Enter alone is a password at the prompt.
         status, output, _ = converse("test-trigger", trigger_prompt, "!")
         assert status == 1, output
         assert "Scanning face" not in output, output

@@ -234,15 +234,15 @@ fn check_layer(layer: &Layer) -> Result<(), String> {
     if layer.timeout_seconds == Some(0) {
         return Err("timeout_seconds must be at least 1".to_owned());
     }
-    for (name, prompt) in [
+    for (name, text) in [
         ("password_prompt", &layer.password_prompt),
-        ("finish_prompt", &layer.finish_prompt),
+        ("wait_message", &layer.wait_message),
     ] {
-        if let Some(prompt) = prompt {
-            if prompt.trim().is_empty() {
+        if let Some(text) = text {
+            if text.trim().is_empty() {
                 return Err(format!("{name} must contain text"));
             }
-            check_line(name, prompt)?;
+            check_line(name, text)?;
         }
     }
     if let Some(fingerprint) = &layer.fingerprint

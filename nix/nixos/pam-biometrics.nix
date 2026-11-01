@@ -134,8 +134,9 @@ in
               decides at once. Otherwise, with the policy value
               `after_password = "wait"` (the default), `finish` asks
               nothing, shows `wait_message`, and watches a terminal in
-              line mode for the face trigger. With
-              `after_password = "prompt"`, for example for `polkit-1`,
+              line mode for the face trigger: `PAM_TTY`, or the terminal of
+              the polkit agent, such as pkttyagent under `run0`. With
+              `after_password = "prompt"`, for clients without a terminal,
               `finish` asks once with `after_password_prompt`; the trigger
               as the answer starts a face scan. Then `finish` waits up to
               `timeout_seconds` for a finger or a face, and
@@ -157,6 +158,14 @@ in
 
     # The daemon asks polkit before face model changes.
     security.polkit.enable = true;
+
+    # The socket-activated polkit agent helper has no PAM_TTY. During the
+    # wait of finish, pam_biometrics.so reads trigger lines from the
+    # controlling terminal of the agent at the other end of the socket, for
+    # example pkttyagent under run0. The upstream unit allows only
+    # /dev/null. PrivateDevices keeps /dev/pts, so read access to the
+    # pseudo terminals is enough.
+    systemd.services."polkit-agent-helper@".serviceConfig.DeviceAllow = [ "char-pts r" ];
 
     environment.etc."pam-biometrics/policy.json".source = policyFile;
 

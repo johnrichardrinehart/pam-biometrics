@@ -1,11 +1,15 @@
-"""Drive one pamtester authentication through a terminal.
+"""Drive one authentication through a terminal.
 
 Usage: converse [--no-tty] SERVICE USER STEP...
+       converse --run0 STEP...
 
 A step "?TEXT" waits for TEXT in the output. A step "!TEXT" types TEXT and
 Enter. A step "=PATH" waits until the file PATH exists. The script prints
-the output and exits with the status of pamtester. With --no-tty, PAM_TTY
-stays unset, as under the socket-activated polkit agent helper.
+the output and exits with the status of the command.
+
+The first form runs pamtester. With --no-tty, PAM_TTY stays unset. The
+second form runs "run0 true": pkttyagent asks in this terminal, and the
+socket-activated polkit agent helper runs the polkit-1 stack.
 """
 
 import io
@@ -18,20 +22,20 @@ import pexpect
 
 def main():
     arguments = sys.argv[1:]
-    no_tty = arguments[:1] == ["--no-tty"]
-    service, user, *steps = arguments[1:] if no_tty else arguments
+    if arguments[:1] == ["--run0"]:
+        steps = arguments[1:]
+        program, args = "run0", ["true"]
+    else:
+        no_tty = arguments[:1] == ["--no-tty"]
+        service, user, *steps = arguments[1:] if no_tty else arguments
+        # pamtester sets PAM_TTY only on request. The terminal is the pty
+        # that pexpect gives to pamtester, so that pam_biometrics.so finish
+        # can read trigger lines from it.
+        item = "" if no_tty else '-I "tty=$(tty)" '
+        command = "exec pamtester " + item + '"$0" "$1" authenticate'
+        program, args = "sh", ["-c", command, service, user]
     output = io.StringIO()
-    # pamtester sets PAM_TTY only on request. The terminal is the pty that
-    # pexpect gives to pamtester, so that pam_biometrics.so finish can read
-    # trigger lines from it.
-    item = "" if no_tty else '-I "tty=$(tty)" '
-    command = "exec pamtester " + item + '"$0" "$1" authenticate'
-    child = pexpect.spawn(
-        "sh",
-        ["-c", command, service, user],
-        encoding="utf-8",
-        timeout=60,
-    )
+    child = pexpect.spawn(program, args, encoding="utf-8", timeout=60)
     child.logfile_read = output
     step = "the end of the output"
     try:

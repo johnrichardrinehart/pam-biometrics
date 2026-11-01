@@ -16,7 +16,7 @@
   "services": {
     "sudo": { "factors": ["fingerprint", "face"] },
     "greetd": { "timeout_seconds": 20, "face": { "trigger": "f" } },
-    "polkit-1": { "after_password": "prompt" }
+    "lightdm": { "after_password": "prompt" }
   },
   "users": {
     "john": {

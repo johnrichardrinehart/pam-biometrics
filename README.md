@@ -101,10 +101,25 @@ example `Fingerprint recognized.` or `Face not certain. Scan again.`.
 ### Face trigger during the wait
 
 With `"after_password": "wait"`, `finish` reads lines from the terminal of
-the application during the wait if `PAM_TTY` names a terminal in line mode
-(`ICANON`). That is the case for `login`, `sudo`, and `su` on a terminal. A
-line equal to `face.trigger` starts a face scan. With the default trigger,
-that is Enter alone. The module discards other lines.
+the application during the wait if that terminal is in line mode
+(`ICANON`). That is the case for `login`, `sudo`, and `su` on a terminal,
+and for `run0` and `pkexec` through `pkttyagent`. A line equal to
+`face.trigger` starts a face scan. With the default trigger, that is Enter
+alone. The module discards other lines.
+
+The module finds the terminal in this order:
+
+1. `PAM_TTY`, if it names a usable terminal.
+2. Otherwise the controlling terminal of the client at the other end of the
+   standard input, if the standard input is a Unix stream socket. polkit
+   127 runs `polkit-agent-helper-1` socket-activated: its standard input is
+   a socket to the polkit agent, and `PAM_TTY` is unset. The module reads
+   the peer process from `SO_PEERCRED`, its controlling terminal from
+   `tty_nr` in `/proc/PID/stat`, and opens `/dev/pts/N` or `/dev/ttyN`
+   only if the device number of the opened file is that terminal and the
+   user of the peer owns it.
+
+Rules for both:
 
 - `PAM_TTY` can be a name such as `tty1` or `pts/3`, or a path under
   `/dev/`. Other values, such as an X display `:0`, mean no terminal.
@@ -116,13 +131,17 @@ that is Enter alone. The module discards other lines.
 - The module reads the terminal only during the wait, and nothing it reads
   is a secret: a line only decides whether to start a scan. The password
   comes from the prompt of `start`.
-- Graphical clients have no terminal. A key binding starts a scan there.
-- polkit 127 runs `polkit-agent-helper-1` socket-activated, without a
-  terminal and without `PAM_TTY`, so polkit authentications such as `run0`
-  have no trigger during the wait. Set `"after_password": "prompt"` for the
-  `polkit-1` service: the agent then shows the prompt of `finish`, and
-  Enter there starts a scan. With `prompt`, the module never opens
-  `PAM_TTY`.
+- Graphical clients have no terminal. A key binding starts a scan there,
+  or `"after_password": "prompt"` gives the user one prompt in the client.
+- The fallback reads only the terminal of the client that runs the
+  authentication, owned by the user of that client, the same terminal where
+  the user just typed the password into the agent. It reads only during the
+  wait and only to detect the trigger line. Nothing read there is used as a
+  secret.
+- The NixOS module allows the sandboxed `polkit-agent-helper@.service` to
+  read pseudo terminals (`DeviceAllow=char-pts r`). The upstream unit
+  allows only `/dev/null`. Its private `/dev` has no virtual consoles, so a
+  `pkttyagent` on a virtual console has no trigger during the wait.
 
 The factors run like this:
 
@@ -400,11 +419,14 @@ The applications differ in how they show the prompts:
   application can wait through it. The application may show the wait
   message and the other information messages in its own way, or not at
   all.
-- Only applications that set `PAM_TTY` to a terminal in line mode get the
-  face trigger during that wait. Elsewhere, a key binding starts a scan,
-  or `"after_password": "prompt"` gives the user one prompt to press Enter
-  at. An application that answers every hidden prompt with the password
-  skips that prompt: the answer is not the trigger, so `finish` just waits.
+- Only applications whose terminal the module finds, through `PAM_TTY` or
+  the polkit agent socket, get the face trigger during that wait.
+  Elsewhere, a key binding starts a scan, or `"after_password": "prompt"`
+  gives the user one prompt to press Enter at. Choose `prompt` for clients
+  without a terminal, such as graphical greeters. A prompt cannot be
+  interrupted: a finger after the password then needs Enter too. An
+  application that answers every hidden prompt with the password skips
+  that prompt: the answer is not the trigger, so `finish` just waits.
 
 ## Key binding
 
@@ -580,7 +602,7 @@ built-in defaults apply. Unknown fields are errors. The schema is
   "services": {
     "sudo": { "factors": ["fingerprint", "face"] },
     "greetd": { "timeout_seconds": 20, "face": { "trigger": "f" } },
-    "polkit-1": { "after_password": "prompt" }
+    "lightdm": { "after_password": "prompt" }
   },
   "users": {
     "john": {

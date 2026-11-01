@@ -36,13 +36,16 @@
 //! scan. A conversation error gives `PAM_CONV_ERR`.
 //!
 //! With `after_password: wait`, `finish` asks nothing. During the wait it
-//! reads lines from `PAM_TTY` if it is a terminal in line mode (`ICANON`),
-//! for example under `login`, `sudo`, or `su`. A line equal to the face
-//! trigger starts a face scan. Other lines are discarded. The module opens
-//! the terminal read-only and non-blocking, never changes its settings,
-//! never reads it outside the wait or without `ICANON`, and closes it
-//! before `finish` returns. Nothing read from the terminal is used as a
-//! secret: a line only selects whether to scan.
+//! reads lines from the terminal of the application if it is in line mode
+//! (`ICANON`): `PAM_TTY`, for example under `login`, `sudo`, or `su`, or
+//! else the controlling terminal of the peer of the standard input if that
+//! is a Unix stream socket and the user of the peer owns the terminal, for
+//! example pkttyagent under the socket-activated polkit agent helper. A
+//! line equal to the face trigger starts a face scan. Other lines are
+//! discarded. The module opens the terminal read-only and non-blocking,
+//! never changes its settings, never reads it outside the wait or without
+//! `ICANON`, and closes it before `finish` returns. Nothing read from the
+//! terminal is used as a secret: a line only selects whether to scan.
 //!
 //! A crash of the helper or of this module gives no decision, so that a
 //! fault cannot lock the user out. The password stays necessary in the rest
@@ -408,11 +411,24 @@ struct Tty {
     pending: Vec<u8>,
 }
 
+/// A device number as (major, minor).
+type DeviceNumber = (u32, u32);
+
+/// What the terminal of the peer must be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Expected {
+    /// The device number from `tty_nr`.
+    device: DeviceNumber,
+    /// The user of the peer process.
+    uid: libc::uid_t,
+}
+
 impl Tty {
     /// Opens `path` read-only and non-blocking. Returns `None` unless it is
-    /// a character device with a terminal in line mode. Discards the input
-    /// that waits already, so that only lines from the wait count.
-    fn open(path: &Path) -> Option<Self> {
+    /// a character device with a terminal in line mode, and, with
+    /// `expected`, unless it has that device number and owner. Discards the
+    /// input that waits already, so that only lines from the wait count.
+    fn open(path: &Path, expected: Option<Expected>) -> Option<Self> {
         let path = CString::new(path.as_os_str().as_bytes()).ok()?;
         // SAFETY: `path` is a C string. The flags open no controlling
         // terminal and do not block.
@@ -433,8 +449,15 @@ impl Tty {
             return None;
         }
         // SAFETY: `fstat` filled the structure.
-        if unsafe { status.assume_init() }.st_mode & libc::S_IFMT != libc::S_IFCHR {
+        let status = unsafe { status.assume_init() };
+        if status.st_mode & libc::S_IFMT != libc::S_IFCHR {
             return None;
+        }
+        if let Some(expected) = expected {
+            let device = (libc::major(status.st_rdev), libc::minor(status.st_rdev));
+            if device != expected.device || status.st_uid != expected.uid {
+                return None;
+            }
         }
         let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
         // SAFETY: `termios` has room for a termios structure.
@@ -479,7 +502,98 @@ impl Tty {
     }
 }
 
-/// Opens the terminal of the application, if it is one in line mode.
+/// Returns the peer process (pid, uid) of `fd` if it is a connected Unix
+/// stream socket.
+fn peer_credentials(fd: RawFd) -> Option<(libc::pid_t, libc::uid_t)> {
+    let mut kind: c_int = 0;
+    let mut length = libc::socklen_t::try_from(size_of::<c_int>()).ok()?;
+    // SAFETY: `kind` has room for an int. A descriptor that is no socket
+    // gives an error.
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&raw mut kind).cast(),
+            &raw mut length,
+        )
+    };
+    if result != 0 || kind != libc::SOCK_STREAM {
+        return None;
+    }
+    let mut address = std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
+    let mut length = libc::socklen_t::try_from(size_of::<libc::sockaddr_storage>()).ok()?;
+    // SAFETY: `address` has room for any socket address.
+    if unsafe { libc::getsockname(fd, address.as_mut_ptr().cast(), &raw mut length) } != 0 {
+        return None;
+    }
+    // SAFETY: zeroed and filled by getsockname.
+    if c_int::from(unsafe { address.assume_init() }.ss_family) != libc::AF_UNIX {
+        return None;
+    }
+    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::zeroed();
+    let mut length = libc::socklen_t::try_from(size_of::<libc::ucred>()).ok()?;
+    // SAFETY: `credentials` has room for a ucred structure.
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &raw mut length,
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    // SAFETY: zeroed and filled by getsockopt.
+    let credentials = unsafe { credentials.assume_init() };
+    (credentials.pid > 0).then_some((credentials.pid, credentials.uid))
+}
+
+/// Returns the controlling terminal from the text of `/proc/PID/stat`, or
+/// `None` without one. The command name in parentheses can contain any
+/// character, so the fields count from the last `)`.
+fn stat_terminal(stat: &str) -> Option<DeviceNumber> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    // state, ppid, pgrp, session, tty_nr.
+    let tty_nr: u32 = rest.split_ascii_whitespace().nth(4)?.parse().ok()?;
+    if tty_nr == 0 {
+        return None;
+    }
+    // The kernel encodes the device as in new_encode_dev.
+    let major = (tty_nr >> 8) & 0xfff;
+    let minor = (tty_nr & 0xff) | ((tty_nr >> 12) & 0xf_ff00);
+    Some((major, minor))
+}
+
+/// Returns the path of a terminal device: `/dev/pts/N` for a Unix98
+/// pseudo terminal, `/dev/ttyN` for a virtual console. [`Tty::open`]
+/// checks the device number of the path.
+fn terminal_path((major, minor): DeviceNumber) -> Option<PathBuf> {
+    match major {
+        136..=143 => Some(PathBuf::from(format!(
+            "/dev/pts/{}",
+            (major - 136) * 256 + minor
+        ))),
+        4 if (1..=63).contains(&minor) => Some(PathBuf::from(format!("/dev/tty{minor}"))),
+        _ => None,
+    }
+}
+
+/// Opens the controlling terminal of the peer of `fd`, if `fd` is a Unix
+/// stream socket, the terminal is in line mode, and the user of the peer
+/// owns it. The socket-activated polkit agent helper talks to the polkit
+/// agent, for example pkttyagent, through its standard input.
+fn peer_terminal(fd: RawFd) -> Option<Tty> {
+    let (pid, uid) = peer_credentials(fd)?;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let device = stat_terminal(&stat)?;
+    Tty::open(&terminal_path(device)?, Some(Expected { device, uid }))
+}
+
+/// Opens the terminal of the application, if it is one in line mode:
+/// `PAM_TTY`, or else the terminal of the peer of the standard input.
 ///
 /// # Safety
 ///
@@ -487,12 +601,16 @@ impl Tty {
 unsafe fn terminal(pamh: *mut PamHandle) -> Option<Tty> {
     let mut item: *const c_void = std::ptr::null();
     // SAFETY: `pamh` is valid. PAM_TTY is a C string that PAM owns.
-    if unsafe { pam_get_item(pamh, PAM_TTY, &raw mut item) } != PAM_SUCCESS || item.is_null() {
-        return None;
-    }
-    // SAFETY: PAM_TTY is a C string.
-    let item = unsafe { CStr::from_ptr(item.cast()) }.to_bytes();
-    Tty::open(&tty_path(item)?)
+    let tty = if unsafe { pam_get_item(pamh, PAM_TTY, &raw mut item) } == PAM_SUCCESS
+        && !item.is_null()
+    {
+        // SAFETY: PAM_TTY is a C string.
+        let item = unsafe { CStr::from_ptr(item.cast()) }.to_bytes();
+        tty_path(item).and_then(|path| Tty::open(&path, None))
+    } else {
+        None
+    };
+    tty.or_else(|| peer_terminal(libc::STDIN_FILENO))
 }
 
 /// Returns the command that runs the helper.
@@ -1428,7 +1546,7 @@ mod tests {
         // Input from before the wait does not count.
         pty.type_text(b"stale\n");
         std::thread::sleep(Duration::from_millis(200));
-        let mut tty = Tty::open(&pty.path).expect("a terminal in line mode");
+        let mut tty = Tty::open(&pty.path, None).expect("a terminal in line mode");
         assert!(tty.read_lines().unwrap().is_empty());
         pty.type_text(b"x\n\n");
         assert_eq!(tty_lines(&mut tty, 2), [&b"x"[..], b""]);
@@ -1438,14 +1556,182 @@ mod tests {
     fn tty_without_line_mode_or_a_terminal_is_not_read() {
         let pty = Pty::new();
         pty.set_line_mode(false);
-        assert!(Tty::open(&pty.path).is_none());
+        assert!(Tty::open(&pty.path, None).is_none());
         pty.set_line_mode(true);
-        assert!(Tty::open(&pty.path).is_some());
+        assert!(Tty::open(&pty.path, None).is_some());
         // A character device that is not a terminal.
-        assert!(Tty::open(Path::new("/dev/null")).is_none());
+        assert!(Tty::open(Path::new("/dev/null"), None).is_none());
         // A regular file, and a missing file.
-        assert!(Tty::open(Path::new("/proc/self/status")).is_none());
-        assert!(Tty::open(Path::new("/dev/pam-biometrics-missing")).is_none());
+        assert!(Tty::open(Path::new("/proc/self/status"), None).is_none());
+        assert!(Tty::open(Path::new("/dev/pam-biometrics-missing"), None).is_none());
+    }
+
+    #[test]
+    fn stat_terminals() {
+        let stat = |tty_nr: u32| format!("4321 (pkt) ty) (agent) S 1 4321 4321 {tty_nr} 4321 0 0");
+        assert_eq!(stat_terminal(&stat(34816)), Some((136, 0)));
+        // pts/300: the minor needs more than 8 bits.
+        let pts_300 = (0x12c & 0xff) | (136 << 8) | ((0x12c & !0xff) << 12);
+        assert_eq!(stat_terminal(&stat(pts_300)), Some((136, 300)));
+        assert_eq!(stat_terminal(&stat(1025)), Some((4, 1)));
+        assert_eq!(stat_terminal(&stat(0)), None);
+        assert_eq!(stat_terminal("4321 (agent) S 1"), None);
+        assert_eq!(stat_terminal("garbage"), None);
+    }
+
+    #[test]
+    fn terminal_paths() {
+        assert_eq!(terminal_path((136, 0)), Some(PathBuf::from("/dev/pts/0")));
+        assert_eq!(
+            terminal_path((136, 300)),
+            Some(PathBuf::from("/dev/pts/300"))
+        );
+        assert_eq!(terminal_path((137, 5)), Some(PathBuf::from("/dev/pts/261")));
+        assert_eq!(terminal_path((4, 1)), Some(PathBuf::from("/dev/tty1")));
+        assert_eq!(terminal_path((4, 63)), Some(PathBuf::from("/dev/tty63")));
+        for device in [(4, 0), (4, 64), (5, 0), (5, 1), (1, 3), (144, 0)] {
+            assert_eq!(terminal_path(device), None, "{device:?}");
+        }
+    }
+
+    /// Starts a child process that connects to a new listener, as
+    /// pkttyagent connects to the polkit agent helper. With `terminal`, the
+    /// child makes it its controlling terminal first. Returns the child and
+    /// the accepted socket. A socket pair would not do: its peer
+    /// credentials name the process that created the pair.
+    fn peer(terminal: Option<RawFd>) -> (Child, UnixStream) {
+        use std::os::unix::process::CommandExt as _;
+        let directory = std::env::temp_dir().join(format!(
+            "pam-biometrics-peer-{}-{}",
+            std::process::id(),
+            terminal.unwrap_or(-1)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("socket");
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        // SAFETY: an all-zero sockaddr_un is valid.
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        address.sun_family = libc::sa_family_t::try_from(libc::AF_UNIX).unwrap();
+        for (slot, byte) in address.sun_path.iter_mut().zip(path.as_os_str().as_bytes()) {
+            *slot = c_char::from_ne_bytes([*byte]);
+        }
+        let length = libc::socklen_t::try_from(size_of::<libc::sockaddr_un>()).unwrap();
+        let mut command = Command::new("sleep");
+        command.arg("30").stdin(Stdio::null());
+        // SAFETY: setsid, ioctl, socket, connect, and dup2 are
+        // async-signal-safe. The closure allocates nothing.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setsid() < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if let Some(terminal) = terminal
+                    && libc::ioctl(terminal, libc::TIOCSCTTY, 0) < 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                if fd < 0
+                    || libc::connect(fd, (&raw const address).cast(), length) < 0
+                    || libc::dup2(fd, libc::STDIN_FILENO) < 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().unwrap();
+        let (ours, _) = listener.accept().unwrap();
+        std::fs::remove_dir_all(&directory).unwrap();
+        (child, ours)
+    }
+
+    #[test]
+    fn peer_terminal_finds_the_controlling_terminal_of_the_peer() {
+        let pty = Pty::new();
+        let (mut child, ours) = peer(Some(pty.slave.as_raw_fd()));
+        // The child sets its terminal before exec. Wait for the exec.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let tty = loop {
+            if let Some(tty) = peer_terminal(ours.as_raw_fd()) {
+                break tty;
+            }
+            assert!(Instant::now() < deadline, "no terminal of the peer");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // The trigger line on the terminal of the peer sends `scan` during
+        // the wait of finish.
+        let mut session = start_helper(&format!(
+            r#"{GREETING}
+read -r command; echo 'info Wait.'
+read -r command; echo "info got $command"
+exit 0"#
+        ));
+        let master = pty.master.try_clone().unwrap();
+        let typist = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            // SAFETY: one byte from a valid buffer.
+            unsafe { libc::write(master.as_raw_fd(), b"\n".as_ptr().cast(), 1) };
+        });
+        let mut conversation = Script::new(&[]);
+        let status = exited(session.finish(&mut conversation, Some(tty)));
+        typist.join().unwrap();
+        assert_eq!(pam_result(status.code()), PAM_SUCCESS);
+        assert_eq!(conversation.infos, ["Wait.", "got scan"]);
+
+        // The terminal must belong to the user of the peer.
+        let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `status` has room for a stat structure.
+        assert_eq!(
+            unsafe { libc::fstat(pty.slave.as_raw_fd(), status.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: fstat filled it.
+        let status = unsafe { status.assume_init() };
+        let device = (libc::major(status.st_rdev), libc::minor(status.st_rdev));
+        let uid = status.st_uid;
+        assert!(Tty::open(&pty.path, Some(Expected { device, uid })).is_some());
+        assert!(
+            Tty::open(
+                &pty.path,
+                Some(Expected {
+                    device,
+                    uid: uid + 1
+                })
+            )
+            .is_none()
+        );
+        let other = (device.0, device.1 + 1);
+        assert!(Tty::open(&pty.path, Some(Expected { device: other, uid })).is_none());
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn peer_terminal_needs_a_socket_peer_with_a_terminal() {
+        // A peer without a controlling terminal.
+        let (mut child, ours) = peer(None);
+        assert!(peer_terminal(ours.as_raw_fd()).is_none());
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        // Not a stream socket, or no socket at all.
+        let (datagram, _other) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        assert!(peer_credentials(datagram.as_raw_fd()).is_none());
+        let pty = Pty::new();
+        assert!(peer_credentials(pty.slave.as_raw_fd()).is_none());
+        let file = std::fs::File::open("/dev/null").unwrap();
+        assert!(peer_credentials(file.as_raw_fd()).is_none());
+
+        // A stream socket gives the peer.
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        assert_eq!(
+            peer_credentials(ours.as_raw_fd()),
+            // SAFETY: getpid and getuid cannot fail.
+            Some(unsafe { (libc::getpid(), libc::getuid()) })
+        );
     }
 
     #[test]
@@ -1458,7 +1744,7 @@ exit 0"#
         );
         let mut session = start_helper(&script);
         let pty = Pty::new();
-        let tty = Tty::open(&pty.path).expect("a terminal in line mode");
+        let tty = Tty::open(&pty.path, None).expect("a terminal in line mode");
         let typist = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(200));
             // Lines other than the trigger do nothing.

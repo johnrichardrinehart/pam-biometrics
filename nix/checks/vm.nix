@@ -60,6 +60,10 @@ testers.runNixOSTest {
         "${config.security.polkit.package.out}/lib/polkit-1/polkitd --log-level=info"
       ];
 
+      # run0 asks polkit to authenticate alice herself. pkttyagent registers
+      # for the logind session of its process, so runuser opens one (below).
+      security.polkit.adminIdentities = [ "unix-user:alice" ];
+
       # Test only: alice can enroll her own face once the test creates the
       # flag file. Without the file, polkit has no agent to ask and refuses.
       security.polkit.extraConfig = ''
@@ -98,7 +102,9 @@ testers.runNixOSTest {
               timeout_seconds = 15;
             };
             test-rescan.timeout_seconds = 40;
-            # As for run0: no terminal, so finish prompts once.
+            # run0 through pkttyagent, in the default wait mode.
+            polkit-1.timeout_seconds = 8;
+            # A client without a terminal: finish prompts once.
             test-prompt = {
               after_password = "prompt";
               # Longer than a full scan of a stranger, with some margin.
@@ -128,6 +134,7 @@ testers.runNixOSTest {
             "test-trigger"
             "test-rescan"
             "test-prompt"
+            "polkit-1"
           ]
           (_: {
             text = ''
@@ -144,6 +151,7 @@ testers.runNixOSTest {
             ${pamRules.finish}
             account required pam_permit.so
           '';
+          runuser.startSession = true;
         };
     };
 
@@ -188,6 +196,19 @@ testers.runNixOSTest {
         status, output = machine.execute(command)
         elapsed = time.monotonic() - start
         print(f"{service}: status {status} after {elapsed:.1f} s\n{output}")
+        assert status in (0, 1), output
+        no_helper()
+        return status, output, elapsed
+
+
+    def run0(*steps):
+        """Run "run0 true" as alice in a terminal that alice owns, as from
+        her own shell. See converse.py."""
+        command = shlex.join(["runuser", "-u", "alice", "--", "converse", "--run0", *steps])
+        start = time.monotonic()
+        status, output = machine.execute(command)
+        elapsed = time.monotonic() - start
+        print(f"run0: status {status} after {elapsed:.1f} s\n{output}")
         assert status in (0, 1), output
         no_helper()
         return status, output, elapsed
@@ -420,6 +441,22 @@ testers.runNixOSTest {
             )
         )
         assert scans_after == scans_before + 1, (scans_before, scans_after)
+
+    with subtest("run0: the password alone waits, then passes"):
+        # The socket-activated polkit agent helper has no PAM_TTY.
+        status, output, elapsed = run0(PROMPT, PASSWORD, "?" + WAIT + " (8 s).")
+        assert status == 0, output
+        assert "Scanning face" not in output, output
+        assert elapsed >= 8, elapsed
+
+    with subtest("run0: Enter on the terminal of pkttyagent during the wait scans the face"):
+        show("${images.obama2}")
+        status, output, elapsed = run0(PROMPT, PASSWORD, "?" + WAIT + " (8 s).", "!")
+        assert status == 0, output
+        assert "Scanning face" in output, output
+        assert "Face recognized." in output, output
+        assert "other text skips" not in output, output
+        assert elapsed < 8, elapsed
 
     with subtest("an empty factor list leaves the prompt to pam_unix"):
         status, output, elapsed = converse("test-none", "?Password: ", PASSWORD)

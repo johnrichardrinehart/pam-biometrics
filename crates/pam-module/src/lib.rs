@@ -89,8 +89,9 @@ const HELPER_REJECT: i32 = 10;
 /// The name of the session in the PAM handle.
 const DATA_NAME: &CStr = c"pam_biometrics_session";
 
-/// The information message after a face trigger.
-const SCANNING: &[u8] = "Scanning face…".as_bytes();
+/// The time that the helper gets to answer a `scan` request. The daemon
+/// call of the helper times out after 5 s.
+const SCAN_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The trigger starts at most this many scans in `start`. After that, every
 /// response is the password. An application that repeats a response
@@ -326,6 +327,8 @@ enum Message<'a> {
     Ready,
     Info(&'a [u8]),
     Ask(&'a [u8]),
+    /// The reply to `scan`.
+    ScanReply,
     Unknown,
 }
 
@@ -344,6 +347,7 @@ impl<'a> Message<'a> {
             b"ready" => Self::Ready,
             b"info" => Self::Info(text),
             b"ask" => Self::Ask(text),
+            b"scan" => Self::ScanReply,
             _ => Self::Unknown,
         }
     }
@@ -583,7 +587,7 @@ impl Session {
                 Message::Trigger(text) => session.greeting.trigger = Some(text.to_vec()),
                 Message::Ready => break,
                 Message::AfterPasswordPrompt => session.greeting.prompt_after = true,
-                Message::Info(_) | Message::Ask(_) | Message::Unknown => {}
+                Message::Info(_) | Message::Ask(_) | Message::ScanReply | Message::Unknown => {}
             }
         }
         match (prompt, reprompt) {
@@ -675,6 +679,21 @@ impl Session {
         }
     }
 
+    /// Asks the helper for a face scan and shows its lines until its reply.
+    /// The helper shows `Scanning face…` only for a new scan, so a trigger
+    /// during a running scan shows nothing new.
+    fn request_scan(&mut self, conversation: &mut dyn Conversation) {
+        self.send(b"scan\n");
+        let deadline = Instant::now() + SCAN_REPLY_TIMEOUT;
+        while let Ok(Some(line)) = self.read_line(Some(deadline)) {
+            match Message::parse(&line) {
+                Message::Info(text) => conversation.info(text),
+                Message::ScanReply => return,
+                _ => {}
+            }
+        }
+    }
+
     /// Asks for the password before the password module. Returns
     /// `PAM_IGNORE`, or `PAM_CONV_ERR` if the application gives no
     /// response.
@@ -697,8 +716,7 @@ impl Session {
             {
                 drop(response);
                 triggers += 1;
-                self.send(b"scan\n");
-                conversation.info(SCANNING);
+                self.request_scan(conversation);
                 continue;
             }
             conversation.set_password(&response);
@@ -725,8 +743,8 @@ impl Session {
                         let trigger =
                             is_trigger(self.greeting.trigger.as_deref(), response.bytes());
                         drop(response);
+                        // The helper starts the scan and shows its lines.
                         if trigger {
-                            conversation.info(SCANNING);
                             self.send(b"answer trigger\n");
                         } else {
                             self.send(b"answer other\n");
@@ -753,8 +771,9 @@ impl Session {
                 match open.read_lines() {
                     Ok(lines) => {
                         for line in lines {
+                            // The reply comes through the loop. The helper
+                            // shows `Scanning face…` for a new scan only.
                             if is_trigger(self.greeting.trigger.as_deref(), &line) {
-                                conversation.info(SCANNING);
                                 self.send(b"scan\n");
                             }
                         }
@@ -1063,8 +1082,12 @@ mod tests {
     const GREETING: &str =
         r"printf 'prompt Password (Enter to scan face): \nreprompt Password: \ntrigger \nready\n'";
 
-    /// Echoes each command as an information line.
-    const ECHO: &str = r#"while read -r command; do echo "info got $command"; done"#;
+    /// Echoes each command as an information line, and answers `scan` like
+    /// the helper with a new scan.
+    const ECHO: &str = r#"while read -r command; do echo "info got $command"; if [ "$command" = scan ]; then echo 'info Scanning face…'; echo 'scan started'; fi; done"#;
+
+    /// Like [`ECHO`], with a scan that runs already.
+    const ECHO_RUNNING: &str = r#"while read -r command; do echo "info got $command"; if [ "$command" = scan ]; then echo 'scan running'; fi; done"#;
 
     fn gone(pid: u32) -> bool {
         // SAFETY: Signal 0 only checks the PID. A zombie still has its PID.
@@ -1234,18 +1257,22 @@ mod tests {
             ]
         );
         assert_eq!(script.password.as_deref(), Some("secret"));
-        assert_eq!(&script.infos[..1], ["Scanning face…"]);
-        // The helper got the scans. Lines that `start` relayed do not come
-        // again.
-        let mut scans = script
-            .infos
-            .iter()
-            .filter(|info| *info == "got scan")
-            .count();
-        while scans < 2 {
-            assert_eq!(next_line(&mut session), "info got scan");
-            scans += 1;
-        }
+        // `start` waits for each reply, so the lines of the helper come in
+        // order and before the next prompt.
+        assert_eq!(
+            script.infos,
+            ["got scan", "Scanning face…", "got scan", "Scanning face…"]
+        );
+    }
+
+    #[test]
+    fn trigger_during_a_running_scan_shows_nothing_new() {
+        let mut session = start_helper(&format!("{GREETING}; {ECHO_RUNNING}"));
+        let mut script = Script::new(&["", "secret"]);
+        assert_eq!(session.start(&mut script), PAM_IGNORE);
+        assert_eq!(script.prompts.len(), 2);
+        assert_eq!(script.infos, ["got scan"]);
+        assert_eq!(script.password.as_deref(), Some("secret"));
     }
 
     #[test]
@@ -1444,10 +1471,7 @@ exit 0"#
         let mut conversation = Script::new(&[]);
         let status = exited(session.finish(&mut conversation, Some(tty)));
         assert_eq!(pam_result(status.code()), PAM_SUCCESS);
-        assert_eq!(
-            conversation.infos,
-            ["got finish", "Wait.", "Scanning face…", "got scan"]
-        );
+        assert_eq!(conversation.infos, ["got finish", "Wait.", "got scan"]);
         assert!(conversation.prompts.is_empty());
         drop(typist);
     }
@@ -1510,11 +1534,11 @@ read -r answer; echo "info got $answer"; exit {code}"#
             conversation.prompts,
             ["Touch the fingerprint reader or press Enter to scan your face (other text skips): "]
         );
+        // The helper shows `Scanning face…` for a new scan.
         assert_eq!(
             conversation.infos,
             [
                 "Fingerprint not recognized. Try again.",
-                "Scanning face…",
                 "got answer trigger"
             ]
         );

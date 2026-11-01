@@ -25,20 +25,25 @@
 //!
 //! | Command          | Effect                                                                  |
 //! |------------------|-------------------------------------------------------------------------|
-//! | `scan`           | Start a face scan for the user.                                         |
+//! | `scan`           | Ask for a face scan. The helper replies `scan started`, `scan running` (a scan runs already and counts), or `scan failed`. |
 //! | `state`          | The helper replies `state VERDICT FACE`.                                |
 //! | `finish`         | Wait for a decision until the timeout, then exit with the step exit code. |
 //! | `answer trigger` | The reply to `ask`: the response was the face trigger.                 |
 //! | `answer other`   | The reply to `ask`: any other response.                                |
 //! | `stop`           | Stop the factors and exit. The end of the input does the same.          |
 //!
-//! The module may send `scan` during the wait of `finish`.
+//! The module may send `scan` during the wait of `finish`. A started scan
+//! also gives `info Scanning face…` before the reply. A running scan gives
+//! no second message. Before the prompt or the wait message, `finish` waits
+//! for a scan that runs already; the fingerprint counts meanwhile, and the
+//! first match or any reject decides.
 //!
 //! The helper sends these lines at any time:
 //!
 //! | Line                   | Meaning                                                                 |
 //! |------------------------|-------------------------------------------------------------------------|
 //! | `info TEXT`            | A line for the user.                                                    |
+//! | `scan WORD`            | The reply to `scan`: `started`, `running`, or `failed`.                 |
 //! | `state VERDICT FACE`   | VERDICT is `success`, `reject`, or `pending`. FACE is `scanning` or `idle`. |
 //! | `ask TEXT`             | Only with `after_password: prompt`, once in `finish` before any wait: prompt with TEXT, then send `answer`. |
 //!

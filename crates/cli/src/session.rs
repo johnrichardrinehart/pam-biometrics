@@ -43,12 +43,39 @@ pub trait FactorTask: Send {
 
 /// Starts face scans and reports a running scan.
 pub trait FaceControl {
-    /// Starts a face scan for the user. Returns false if the daemon refuses
-    /// the request or is unreachable.
-    fn scan(&mut self) -> bool;
+    /// Asks the daemon for a face scan for the user.
+    fn scan(&mut self) -> ScanStart;
     /// Returns true while a face scan for the user runs.
     fn scanning(&mut self) -> bool;
 }
+
+/// The answer of the daemon to a scan request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScanStart {
+    /// A new scan started. Its result follows.
+    #[default]
+    Started,
+    /// A scan runs already, for example from a key binding. Its result
+    /// follows.
+    Running,
+    /// The daemon refused the request or is unreachable.
+    Failed,
+}
+
+impl ScanStart {
+    /// Returns the word of the `scan` reply.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Running => "running",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// The line after a scan request that started a scan.
+pub const SCANNING: &str = "Scanning face…";
 
 /// The response of the user to an `ask` line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,6 +207,8 @@ pub struct Session<'a, F, W> {
     provisional: BTreeMap<Factor, Outcome>,
     /// The factors that asked their source at least once.
     polled: BTreeSet<Factor>,
+    /// The number of face results so far.
+    face_results: u32,
 }
 
 impl<'a, F: FaceControl, W: Write> Session<'a, F, W> {
@@ -203,6 +232,7 @@ impl<'a, F: FaceControl, W: Write> Session<'a, F, W> {
             finished: BTreeMap::new(),
             provisional: BTreeMap::new(),
             polled: BTreeSet::new(),
+            face_results: 0,
         }
     }
 
@@ -245,7 +275,10 @@ impl<'a, F: FaceControl, W: Write> Session<'a, F, W> {
         };
         match input {
             Input::Event(event) => self.on_event(event),
-            Input::Command(Command::Scan) => self.scan(),
+            Input::Command(Command::Scan) => {
+                let start = self.scan();
+                self.send(&format!("scan {}", start.word()));
+            }
             Input::Command(Command::State) => self.report_state(),
             Input::Command(Command::Finish) => return Next::Finish,
             Input::Command(Command::Answer(answer)) => return Next::Answer(answer),
@@ -262,6 +295,9 @@ impl<'a, F: FaceControl, W: Write> Session<'a, F, W> {
     }
 
     fn on_event(&mut self, event: Event) {
+        if let Event::Provisional(Factor::Face, _) | Event::Finished(Factor::Face, _) = event {
+            self.face_results += 1;
+        }
         match event {
             Event::Message(text) => self.info(&text),
             Event::Polled(factor) => {
@@ -290,10 +326,52 @@ impl<'a, F: FaceControl, W: Write> Session<'a, F, W> {
         }
     }
 
-    /// Starts a face scan.
-    fn scan(&mut self) {
-        if self.settings.enabled(Factor::Face) && !self.face.scan() {
-            self.info("The face scan did not start.");
+    /// Asks for a face scan. A scan that runs already, for example from a
+    /// key binding, counts: no second scan and no second message.
+    fn scan(&mut self) -> ScanStart {
+        if !self.settings.enabled(Factor::Face) {
+            return ScanStart::Failed;
+        }
+        let start = self.face.scan();
+        match start {
+            ScanStart::Started => self.info(SCANNING),
+            ScanStart::Running => {}
+            ScanStart::Failed => self.info("The face scan did not start."),
+        }
+        start
+    }
+
+    /// Waits for a face scan that runs when `finish` starts, until its
+    /// result, a decision, or `deadline`. Returns the exit code if the
+    /// session ended.
+    fn await_running_scan(&mut self, deadline: Instant) -> Option<i32> {
+        const RECHECK: Duration = Duration::from_secs(1);
+        if !self.settings.enabled(Factor::Face) || !self.face.scanning() {
+            return None;
+        }
+        let results = self.face_results;
+        loop {
+            if let Some(verdict) = self.settled() {
+                return Some(self.conclude(verdict));
+            }
+            if self.face_results != results {
+                return None;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                let verdict = self.current();
+                return Some(self.conclude(verdict));
+            }
+            match self.next(Some(deadline.min(now + RECHECK))) {
+                // A result that the face factor misses ends the wait too.
+                Next::Timeout => {
+                    if Instant::now() < deadline && !self.face.scanning() {
+                        return None;
+                    }
+                }
+                Next::End => return Some(EXIT_NO_DECISION),
+                Next::Handled | Next::Finish | Next::Answer(_) => {}
+            }
         }
     }
 
@@ -364,6 +442,12 @@ impl<'a, F: FaceControl, W: Write> Session<'a, F, W> {
         if let Some(verdict) = self.settled() {
             return self.conclude(verdict);
         }
+        // A scan from before the password, for example from the trigger at
+        // the prompt of start, can still decide. Wait for it before any
+        // prompt or wait message.
+        if let Some(code) = self.await_running_scan(deadline) {
+            return code;
+        }
         let answer = match self.ask.clone() {
             Some(prompt) => {
                 self.send(&format!("ask {prompt}"));
@@ -423,22 +507,32 @@ mod tests {
     const ASK_LINE: &str =
         "ask Touch the fingerprint reader or press Enter to scan your face (other text skips): ";
 
-    /// A face daemon that records the scans.
+    /// A face daemon that records the scan requests.
     #[derive(Clone, Default)]
     struct FakeFace {
         scans: Arc<Mutex<u32>>,
+        /// A scan runs for the whole test.
         scanning: bool,
-        refuse: bool,
+        /// The answer to each scan request.
+        start: ScanStart,
     }
 
     impl FaceControl for FakeFace {
-        fn scan(&mut self) -> bool {
+        fn scan(&mut self) -> ScanStart {
             *self.scans.lock().unwrap() += 1;
-            !self.refuse
+            self.start
         }
 
         fn scanning(&mut self) -> bool {
             self.scanning
+        }
+    }
+
+    fn running() -> FakeFace {
+        FakeFace {
+            scanning: true,
+            start: ScanStart::Running,
+            ..FakeFace::default()
         }
     }
 
@@ -574,7 +668,10 @@ mod tests {
         );
         assert_eq!(code, EXIT_SUCCESS);
         // The scan replaces the wait message.
-        assert_eq!(lines, [ASK_LINE, "info Face recognized."]);
+        assert_eq!(
+            lines,
+            [ASK_LINE, "info Scanning face…", "info Face recognized."]
+        );
         assert_eq!(scans, 1);
         assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
     }
@@ -810,7 +907,15 @@ mod tests {
             ],
         );
         assert_eq!(code, EXIT_SUCCESS);
-        assert_eq!(lines, [INFO_WAIT, "info Face recognized."]);
+        assert_eq!(
+            lines,
+            [
+                INFO_WAIT,
+                "info Scanning face…",
+                "scan started",
+                "info Face recognized."
+            ]
+        );
         assert_eq!(scans, 1);
         assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
     }
@@ -1015,7 +1120,7 @@ mod tests {
     #[test]
     fn a_refused_scan_says_so() {
         let refuse = FakeFace {
-            refuse: true,
+            start: ScanStart::Failed,
             ..FakeFace::default()
         };
         let (_, lines, scans, _) = run(
@@ -1023,8 +1128,167 @@ mod tests {
             refuse,
             vec![(0, command(Command::Scan)), (0, command(Command::Stop))],
         );
-        assert_eq!(lines, ["info The face scan did not start."]);
+        assert_eq!(lines, ["info The face scan did not start.", "scan failed"]);
         assert_eq!(scans, 1);
+    }
+
+    #[test]
+    fn a_started_scan_says_so_once() {
+        let (_, lines, _, _) = run(
+            &allow(),
+            FakeFace::default(),
+            vec![(0, command(Command::Scan)), (0, command(Command::Stop))],
+        );
+        assert_eq!(lines, ["info Scanning face…", "scan started"]);
+    }
+
+    #[test]
+    fn a_trigger_during_a_running_scan_starts_nothing_new() {
+        // From the prompt of start or the terminal: no second message.
+        let (_, lines, scans, _) = run(
+            &allow(),
+            running(),
+            vec![(0, command(Command::Scan)), (0, command(Command::Stop))],
+        );
+        assert_eq!(lines, ["scan running"]);
+        assert_eq!(scans, 1);
+
+        // From the prompt of finish: the running scan decides.
+        let mut idle_at_finish = running();
+        idle_at_finish.scanning = false;
+        let (code, lines, _, _) = run(
+            &prompt(OnNoDecision::Deny),
+            idle_at_finish,
+            vec![
+                (0, command(Command::Finish)),
+                (0, command(Command::Answer(Answer::Trigger))),
+                (100, face(Outcome::Match)),
+            ],
+        );
+        assert_eq!(code, EXIT_SUCCESS);
+        assert_eq!(lines, [ASK_LINE, "info Face recognized."]);
+    }
+
+    #[test]
+    fn a_running_scan_at_finish_that_matches_skips_the_prompt() {
+        for policy in [prompt(OnNoDecision::Deny), deny()] {
+            let (code, lines, _, elapsed) = run(
+                &policy,
+                running(),
+                vec![(0, command(Command::Finish)), (300, face(Outcome::Match))],
+            );
+            assert_eq!(code, EXIT_SUCCESS);
+            // No prompt and no wait message.
+            assert_eq!(lines, ["info Face recognized."]);
+            assert!(elapsed < Duration::from_millis(700), "{elapsed:?}");
+        }
+    }
+
+    #[test]
+    fn a_running_scan_at_finish_without_a_face_leads_to_the_prompt() {
+        let (code, lines, _, _) = run(
+            &prompt(OnNoDecision::Allow),
+            running(),
+            vec![
+                (0, command(Command::Finish)),
+                (100, message("No face found.")),
+                (0, face(Outcome::NoDecision)),
+                (100, command(Command::Answer(Answer::Other))),
+            ],
+        );
+        assert_eq!(code, EXIT_NO_DECISION);
+        assert_eq!(lines, ["info No face found.", ASK_LINE, INFO_WAIT]);
+
+        // With `wait`, the wait message comes after the scan.
+        let (code, lines, _, _) = run(
+            &allow(),
+            running(),
+            vec![
+                (0, command(Command::Finish)),
+                (100, face(Outcome::NoDecision)),
+            ],
+        );
+        assert_eq!(code, EXIT_NO_DECISION);
+        assert_eq!(lines, [INFO_WAIT]);
+    }
+
+    #[test]
+    fn a_running_scan_at_finish_without_a_result_ends_at_the_timeout() {
+        let (code, lines, _, elapsed) = run(
+            &prompt(OnNoDecision::Allow),
+            running(),
+            vec![(0, command(Command::Finish))],
+        );
+        assert_eq!(code, EXIT_NO_DECISION);
+        assert!(lines.is_empty(), "{lines:?}");
+        assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
+    }
+
+    #[test]
+    fn finger_match_while_a_scan_runs_succeeds_at_once() {
+        let (code, lines, _, elapsed) = run(
+            &prompt(OnNoDecision::Deny),
+            running(),
+            vec![
+                (0, command(Command::Finish)),
+                (100, fingerprint(Outcome::Match)),
+            ],
+        );
+        assert_eq!(code, EXIT_SUCCESS);
+        assert_eq!(lines, ["info Fingerprint recognized."]);
+        assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+    }
+
+    #[test]
+    fn face_match_while_the_finger_is_idle_succeeds_at_once() {
+        let (code, lines, _, elapsed) = run(
+            &deny(),
+            FakeFace::default(),
+            vec![(0, command(Command::Finish)), (100, face(Outcome::Match))],
+        );
+        assert_eq!(code, EXIT_SUCCESS);
+        assert_eq!(lines, [INFO_WAIT, "info Face recognized."]);
+        assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+    }
+
+    #[test]
+    fn wrong_finger_while_a_scan_runs_rejects() {
+        let (code, lines, _, elapsed) = run(
+            &allow(),
+            running(),
+            vec![
+                (0, command(Command::Finish)),
+                (100, fingerprint(Outcome::Reject)),
+            ],
+        );
+        assert_eq!(code, EXIT_REJECT);
+        assert_eq!(lines, ["info Not recognized."]);
+        assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+    }
+
+    #[test]
+    fn stranger_face_after_a_finger_match_rejects() {
+        // Both arrive while the user types the password.
+        let (code, lines, _, _) = run(
+            &allow(),
+            FakeFace::default(),
+            vec![
+                (0, command(Command::Scan)),
+                (0, fingerprint(Outcome::Match)),
+                (0, face(Outcome::Reject)),
+                (50, command(Command::Finish)),
+            ],
+        );
+        assert_eq!(code, EXIT_REJECT);
+        assert_eq!(
+            lines,
+            [
+                "info Scanning face…",
+                "scan started",
+                "info Fingerprint recognized.",
+                "info Not recognized."
+            ]
+        );
     }
 
     #[test]
@@ -1036,7 +1300,7 @@ mod tests {
             FakeFace::default(),
             vec![(0, command(Command::Scan)), (0, command(Command::Stop))],
         );
-        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!(lines, ["scan failed"]);
         assert_eq!(scans, 0);
     }
 

@@ -52,6 +52,10 @@ these rules:
   the password alone passes, with `deny`, the attempt fails.
 - A face between `face.match_distance` and `face.reject_distance` counts as
   missing. The user can scan again until the end of the wait.
+- The fingerprint reader stays armed for the whole attempt, also while a
+  face scan runs. The first match of either factor decides, without a wait
+  for the other factor. A reject of either factor at any point still fails
+  the attempt.
 
 ### One attempt
 
@@ -67,8 +71,12 @@ One call of `pam_authenticate` runs these steps:
 3. `pam_unix` checks the password with `try_first_pass`. A wrong password
    ends the attempt. `pam_end` then stops the helper.
 4. `finish` decides with the outcomes so far. A reject decides at once and
-   wins over a match. A match without a reject also decides at once.
-   Otherwise `after_password` selects what happens next:
+   wins over a match. A match without a reject also decides at once. If a
+   face scan runs, for example from the trigger at the prompt of `start`
+   or from a key binding, `finish` first waits for its result, at most
+   until the timeout. The fingerprint counts meanwhile. A decision then
+   ends `finish` without a prompt. Otherwise `after_password` selects what
+   happens next:
    - `wait`, the default: `finish` shows `wait_message` and asks nothing.
      On a terminal in line mode, the face trigger typed during the wait
      starts a face scan.
@@ -171,22 +179,26 @@ The helper sends its settings first:
 
 Then the module sends commands:
 
-| Command          | Effect                                                                  |
-| ---------------- | ----------------------------------------------------------------------- |
-| `scan`           | Start a face scan for the user. Also valid during the wait of `finish`. |
-| `state`          | The helper replies `state VERDICT FACE`.                                |
-| `finish`         | Wait for a decision until the timeout, then exit with the exit code.    |
-| `answer trigger` | The reply to `ask`: the response was the face trigger.                  |
-| `answer other`   | The reply to `ask`: any other response.                                 |
-| `stop`           | Stop the factors and exit. The end of the input does the same.          |
+| Command          | Effect                                                                                                                            |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `scan`           | Ask for a face scan. Also valid during the wait of `finish`. The helper replies `scan started`, `scan running`, or `scan failed`. |
+| `state`          | The helper replies `state VERDICT FACE`.                                                                                          |
+| `finish`         | Wait for a decision until the timeout, then exit with the exit code.                                                              |
+| `answer trigger` | The reply to `ask`: the response was the face trigger.                                                                            |
+| `answer other`   | The reply to `ask`: any other response.                                                                                           |
+| `stop`           | Stop the factors and exit. The end of the input does the same.                                                                    |
 
 The helper sends these lines at any time:
 
-| Line                 | Meaning                                                                                                                      |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `info TEXT`          | A line for the user.                                                                                                         |
-| `state VERDICT FACE` | `VERDICT` is `success`, `reject`, or `pending`. `FACE` is `scanning` or `idle`.                                              |
-| `ask TEXT`           | Only with `"after_password": "prompt"`, once in `finish` before the wait. The module prompts with `TEXT` and sends `answer`. |
+| Line                 | Meaning                                                                                                                          |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `info TEXT`          | A line for the user.                                                                                                             |
+| `scan WORD`          | The reply to `scan`. `running` means that a scan runs already, for example from a key binding; it counts, and nothing new shows. |
+| `state VERDICT FACE` | `VERDICT` is `success`, `reject`, or `pending`. `FACE` is `scanning` or `idle`.                                                  |
+| `ask TEXT`           | Only with `"after_password": "prompt"`, once in `finish` before the wait. The module prompts with `TEXT` and sends `answer`.     |
+
+The helper shows `Scanning face…` when a trigger starts a new scan. A
+trigger during a running scan starts no second scan and shows nothing new.
 
 `finish` sends the wait message as an `info` line when it starts to wait.
 

@@ -36,7 +36,10 @@ testers.runNixOSTest {
           isNormalUser = true;
           password = "alice-password";
         };
-        bob.isNormalUser = true;
+        bob = {
+          isNormalUser = true;
+          password = "bob-password";
+        };
       };
 
       # fprintd runs without a reader. The finger commands report that.
@@ -101,6 +104,13 @@ testers.runNixOSTest {
               # Longer than a full scan of a stranger, with some margin.
               timeout_seconds = 10;
             };
+          };
+          # A strict service for bob only. Scans of bob stop early only at
+          # this distance, so they run the whole scanSeconds. A scan from
+          # the prompt of start then still runs when finish starts.
+          users.bob.services.test-slow = {
+            factors = [ "face" ];
+            face.match_distance = 0.1;
           };
         };
       };
@@ -169,11 +179,11 @@ testers.runNixOSTest {
         machine.fail("pgrep -f 'pam-biometrics pam-[s]ession'")
 
 
-    def converse(service, *steps, tty=True):
-        """Authenticate alice through a terminal. See converse.py. Without
+    def converse(service, *steps, tty=True, user="alice"):
+        """Authenticate a user through a terminal. See converse.py. Without
         tty, PAM_TTY stays unset."""
         options = [] if tty else ["--no-tty"]
-        command = shlex.join(["converse", *options, service, "alice", *steps])
+        command = shlex.join(["converse", *options, service, user, *steps])
         start = time.monotonic()
         status, output = machine.execute(command)
         elapsed = time.monotonic() - start
@@ -373,6 +383,43 @@ testers.runNixOSTest {
         assert "Face not recognized." in output, output
         assert "Not recognized." in output, output
         assert "Authentication failure" in output, output
+
+    with subtest("a scan from before the password decides before the prompt of finish"):
+        # The run0 trace: Enter at the password prompt, the password at once,
+        # and finish starts while the scan still runs.
+        show("${images.obama}")
+        machine.succeed("pam-biometrics face enroll bob")
+        show("${images.obama2}")
+        scans_before = int(
+            machine.succeed(
+                "journalctl -u pam-biometrics.service"
+                " | grep -c 'scan for bob: finished' || true"
+            )
+        )
+        status, output, elapsed = converse(
+            "test-prompt",
+            PROMPT,
+            "!",
+            "?Scanning face",
+            "?Password: ",
+            "!bob-password",
+            tty=False,
+            user="bob",
+        )
+        assert status == 0, output
+        assert "Face recognized." in output, output
+        assert "other text skips" not in output, output
+        assert WAIT not in output, output
+        assert output.count("Scanning face") == 1, output
+        assert "successfully authenticated" in output, output
+        # One scan, from the prompt of start.
+        scans_after = int(
+            machine.succeed(
+                "journalctl -u pam-biometrics.service"
+                " | grep -c 'scan for bob: finished' || true"
+            )
+        )
+        assert scans_after == scans_before + 1, (scans_before, scans_after)
 
     with subtest("an empty factor list leaves the prompt to pam_unix"):
         status, output, elapsed = converse("test-none", "?Password: ", PASSWORD)

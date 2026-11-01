@@ -16,7 +16,7 @@ use std::time::Duration;
 use pam_biometrics_policy::{FaceClass, FaceSettings, Factor, Outcome};
 use pam_biometrics_protocol::{Op, Reply, Request, ScanResult, call};
 
-use crate::session::{Event, FaceControl, FactorTask, Stop, pause};
+use crate::session::{Event, FaceControl, FactorTask, ScanStart, Stop, pause};
 
 /// The pause between two `take` requests without a result.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -70,8 +70,18 @@ impl Source for Daemon {
 }
 
 impl FaceControl for Daemon {
-    fn scan(&mut self) -> bool {
-        self.request(Op::Scan).is_some()
+    fn scan(&mut self) -> ScanStart {
+        match self.request(Op::Scan) {
+            None => ScanStart::Failed,
+            // The daemon joins a scan that runs instead of starting one.
+            Some(reply)
+                if reply.started == Some(false) && reply.result == Some(ScanResult::Scanning) =>
+            {
+                ScanStart::Running
+            }
+            // A new scan, or no enrolled face. The result follows either way.
+            Some(_) => ScanStart::Started,
+        }
     }
 
     fn scanning(&mut self) -> bool {
@@ -391,7 +401,7 @@ mod tests {
             socket: PathBuf::from("/nonexistent/pam-biometrics.socket"),
             user: "alice".to_owned(),
         };
-        assert!(!daemon.scan());
+        assert_eq!(daemon.scan(), ScanStart::Failed);
         assert!(!daemon.scanning());
     }
 }

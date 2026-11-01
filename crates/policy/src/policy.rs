@@ -237,6 +237,7 @@ fn check_layer(layer: &Layer) -> Result<(), String> {
     for (name, text) in [
         ("password_prompt", &layer.password_prompt),
         ("wait_message", &layer.wait_message),
+        ("after_password_prompt", &layer.after_password_prompt),
     ] {
         if let Some(text) = text {
             if text.trim().is_empty() {

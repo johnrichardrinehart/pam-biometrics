@@ -50,6 +50,15 @@ pub trait FaceControl {
     fn scanning(&mut self) -> bool;
 }
 
+/// The response of the user to an `ask` line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Answer {
+    /// The response was the face trigger.
+    Trigger,
+    /// Any other response.
+    Other,
+}
+
 /// A command from the PAM module.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
@@ -59,6 +68,8 @@ pub enum Command {
     State,
     /// `finish`: decide the step, then exit.
     Finish,
+    /// `answer trigger` or `answer other`: the response to `ask`.
+    Answer(Answer),
     /// `stop`: stop the factors and exit.
     Stop,
 }
@@ -71,6 +82,8 @@ impl Command {
             "scan" => Self::Scan,
             "state" => Self::State,
             "finish" => Self::Finish,
+            "answer trigger" => Self::Answer(Answer::Trigger),
+            "answer other" => Self::Answer(Answer::Other),
             "stop" => Self::Stop,
             _ => return None,
         })
@@ -143,6 +156,8 @@ enum Next {
     Handled,
     /// `finish`.
     Finish,
+    /// `answer`.
+    Answer(Answer),
     /// `stop`, or the PAM module closed the connection.
     End,
     /// The deadline passed.
@@ -154,6 +169,8 @@ enum Next {
 pub struct Session<'a, F, W> {
     settings: &'a Settings,
     wait_message: String,
+    /// The text of the `ask` line with `after_password: prompt`.
+    ask: Option<String>,
     inputs: Receiver<Input>,
     face: F,
     out: W,
@@ -167,9 +184,11 @@ pub struct Session<'a, F, W> {
 
 impl<'a, F: FaceControl, W: Write> Session<'a, F, W> {
     /// Creates a session. `finish` shows `wait_message` when it waits.
+    /// With `ask`, `finish` first asks the module to prompt with that text.
     pub fn new(
         settings: &'a Settings,
         wait_message: String,
+        ask: Option<String>,
         inputs: Receiver<Input>,
         face: F,
         out: W,
@@ -177,6 +196,7 @@ impl<'a, F: FaceControl, W: Write> Session<'a, F, W> {
         Self {
             settings,
             wait_message,
+            ask,
             inputs,
             face,
             out,
@@ -191,7 +211,7 @@ impl<'a, F: FaceControl, W: Write> Session<'a, F, W> {
     pub fn run(mut self) -> i32 {
         loop {
             match self.next(None) {
-                Next::Handled | Next::Timeout => {}
+                Next::Handled | Next::Answer(_) | Next::Timeout => {}
                 Next::Finish => return self.finish(),
                 Next::End => return EXIT_NO_DECISION,
             }
@@ -228,6 +248,7 @@ impl<'a, F: FaceControl, W: Write> Session<'a, F, W> {
             Input::Command(Command::Scan) => self.scan(),
             Input::Command(Command::State) => self.report_state(),
             Input::Command(Command::Finish) => return Next::Finish,
+            Input::Command(Command::Answer(answer)) => return Next::Answer(answer),
             Input::Command(Command::Stop) | Input::Closed => return Next::End,
         }
         Next::Handled
@@ -322,9 +343,12 @@ impl<'a, F: FaceControl, W: Write> Session<'a, F, W> {
     }
 
     /// Decides the step after the password. A match or a reject so far
-    /// decides at once. Otherwise `finish` shows the wait message and waits
-    /// for a match or a reject until `timeout_seconds` after its start.
-    /// Without one, `on_no_decision` applies.
+    /// decides at once. Otherwise, with `after_password: prompt`, `finish`
+    /// asks once and waits for the answer. The face trigger as the answer
+    /// starts a face scan, any other answer shows the wait message. With
+    /// `after_password: wait`, `finish` shows the wait message at once.
+    /// Then it waits for a match or a reject until `timeout_seconds` after
+    /// its start. Without one, `on_no_decision` applies.
     fn finish(mut self) -> i32 {
         let deadline =
             Instant::now() + Duration::from_secs(u64::from(self.settings.timeout_seconds));
@@ -334,14 +358,37 @@ impl<'a, F: FaceControl, W: Write> Session<'a, F, W> {
             match self.next(Some(deadline)) {
                 Next::Timeout => break,
                 Next::End => return EXIT_NO_DECISION,
-                Next::Handled | Next::Finish => {}
+                Next::Handled | Next::Finish | Next::Answer(_) => {}
             }
         }
         if let Some(verdict) = self.settled() {
             return self.conclude(verdict);
         }
-        let message = self.wait_message.clone();
-        self.info(&message);
+        let answer = match self.ask.clone() {
+            Some(prompt) => {
+                self.send(&format!("ask {prompt}"));
+                // The prompt blocks the module until the user answers. The
+                // factors still count meanwhile.
+                let answer = loop {
+                    match self.next(None) {
+                        Next::Answer(answer) => break answer,
+                        Next::End => return EXIT_NO_DECISION,
+                        Next::Handled | Next::Finish | Next::Timeout => {}
+                    }
+                };
+                if let Some(verdict) = self.settled() {
+                    return self.conclude(verdict);
+                }
+                answer
+            }
+            None => Answer::Other,
+        };
+        if answer == Answer::Trigger && self.settings.enabled(Factor::Face) {
+            self.scan();
+        } else {
+            let message = self.wait_message.clone();
+            self.info(&message);
+        }
         loop {
             match self.next(Some(deadline)) {
                 Next::Timeout => {
@@ -349,7 +396,7 @@ impl<'a, F: FaceControl, W: Write> Session<'a, F, W> {
                     return self.conclude(verdict);
                 }
                 Next::End => return EXIT_NO_DECISION,
-                Next::Handled | Next::Finish => {}
+                Next::Handled | Next::Finish | Next::Answer(_) => {}
             }
             if let Some(verdict) = self.settled() {
                 return self.conclude(verdict);
@@ -363,7 +410,7 @@ mod tests {
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
 
-    use pam_biometrics_policy::{EXIT_REJECT, EXIT_SUCCESS, OnNoDecision};
+    use pam_biometrics_policy::{AfterPassword, EXIT_REJECT, EXIT_SUCCESS, OnNoDecision};
 
     use super::*;
 
@@ -371,6 +418,10 @@ mod tests {
     const WAIT: &str = "Touch the fingerprint reader or press Enter to scan your face (1 s).";
     const INFO_WAIT: &str =
         "info Touch the fingerprint reader or press Enter to scan your face (1 s).";
+    const ASK: &str =
+        "Touch the fingerprint reader or press Enter to scan your face (other text skips): ";
+    const ASK_LINE: &str =
+        "ask Touch the fingerprint reader or press Enter to scan your face (other text skips): ";
 
     /// A face daemon that records the scans.
     #[derive(Clone, Default)]
@@ -407,6 +458,13 @@ mod tests {
 
     fn deny() -> Settings {
         settings(Combine::Any, OnNoDecision::Deny)
+    }
+
+    fn prompt(on_no_decision: OnNoDecision) -> Settings {
+        Settings {
+            after_password: AfterPassword::Prompt,
+            ..settings(Combine::Any, on_no_decision)
+        }
     }
 
     fn fingerprint(outcome: Outcome) -> Input {
@@ -462,7 +520,17 @@ mod tests {
         let scans = Arc::clone(&face_control.scans);
         let mut out = Vec::new();
         let start = Instant::now();
-        let code = Session::new(settings, WAIT.to_owned(), receiver, face_control, &mut out).run();
+        // The helper derives the text from the policy. Any text works here.
+        let ask = (settings.after_password == AfterPassword::Prompt).then(|| ASK.to_owned());
+        let code = Session::new(
+            settings,
+            WAIT.to_owned(),
+            ask,
+            receiver,
+            face_control,
+            &mut out,
+        )
+        .run();
         let elapsed = start.elapsed();
         drop(feeder);
         let lines = String::from_utf8(out)
@@ -480,16 +548,147 @@ mod tests {
         assert_eq!(Command::parse("state\n"), Some(Command::State));
         assert_eq!(Command::parse("finish\r\n"), Some(Command::Finish));
         assert_eq!(Command::parse("stop"), Some(Command::Stop));
-        for line in [
-            "",
-            "Scan",
-            "scan now",
-            "answer trigger",
-            "answer other",
-            " stop",
-        ] {
+        assert_eq!(
+            Command::parse("answer trigger"),
+            Some(Command::Answer(Answer::Trigger))
+        );
+        assert_eq!(
+            Command::parse("answer other"),
+            Some(Command::Answer(Answer::Other))
+        );
+        for line in ["", "Scan", "scan now", "answer", "answer secret", " stop"] {
             assert_eq!(Command::parse(line), None, "{line:?}");
         }
+    }
+
+    #[test]
+    fn prompt_trigger_scans_then_a_match_succeeds() {
+        let (code, lines, scans, elapsed) = run(
+            &prompt(OnNoDecision::Allow),
+            FakeFace::default(),
+            vec![
+                (0, command(Command::Finish)),
+                (50, command(Command::Answer(Answer::Trigger))),
+                (100, face(Outcome::Match)),
+            ],
+        );
+        assert_eq!(code, EXIT_SUCCESS);
+        // The scan replaces the wait message.
+        assert_eq!(lines, [ASK_LINE, "info Face recognized."]);
+        assert_eq!(scans, 1);
+        assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+    }
+
+    #[test]
+    fn prompt_trigger_then_the_finger_still_counts() {
+        let (code, _, scans, _) = run(
+            &prompt(OnNoDecision::Deny),
+            FakeFace::default(),
+            vec![
+                (0, command(Command::Finish)),
+                (0, command(Command::Answer(Answer::Trigger))),
+                (100, face(Outcome::NoDecision)),
+                (100, fingerprint(Outcome::Match)),
+            ],
+        );
+        assert_eq!(code, EXIT_SUCCESS);
+        assert_eq!(scans, 1);
+    }
+
+    #[test]
+    fn prompt_other_answer_waits_until_the_timeout() {
+        for (on_no_decision, want) in [
+            (OnNoDecision::Allow, EXIT_NO_DECISION),
+            (OnNoDecision::Deny, EXIT_REJECT),
+        ] {
+            let (code, lines, scans, elapsed) = run(
+                &prompt(on_no_decision),
+                FakeFace::default(),
+                vec![
+                    (0, command(Command::Finish)),
+                    (0, command(Command::Answer(Answer::Other))),
+                ],
+            );
+            assert_eq!(code, want);
+            assert_eq!(lines[..2], [ASK_LINE, INFO_WAIT]);
+            assert_eq!(scans, 0);
+            assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
+        }
+    }
+
+    #[test]
+    fn prompt_timeout_counts_from_the_start_of_finish() {
+        // The user answers late. The wait ends at once.
+        let (code, lines, _, elapsed) = run(
+            &prompt(OnNoDecision::Allow),
+            FakeFace::default(),
+            vec![
+                (0, command(Command::Finish)),
+                (1200, command(Command::Answer(Answer::Other))),
+            ],
+        );
+        assert_eq!(code, EXIT_NO_DECISION);
+        assert_eq!(lines, [ASK_LINE, INFO_WAIT]);
+        assert!(elapsed < Duration::from_millis(1600), "{elapsed:?}");
+    }
+
+    #[test]
+    fn prompt_finger_during_the_prompt_decides_after_the_answer() {
+        let (code, lines, scans, elapsed) = run(
+            &prompt(OnNoDecision::Deny),
+            FakeFace::default(),
+            vec![
+                (0, command(Command::Finish)),
+                (50, fingerprint(Outcome::Match)),
+                (50, command(Command::Answer(Answer::Trigger))),
+            ],
+        );
+        assert_eq!(code, EXIT_SUCCESS);
+        assert_eq!(lines, [ASK_LINE, "info Fingerprint recognized."]);
+        // The match came first, so the trigger starts no scan.
+        assert_eq!(scans, 0);
+        assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+    }
+
+    #[test]
+    fn prompt_reject_during_the_prompt_rejects() {
+        let (code, lines, _, elapsed) = run(
+            &prompt(OnNoDecision::Allow),
+            FakeFace::default(),
+            vec![
+                (0, command(Command::Finish)),
+                (50, fingerprint(Outcome::Reject)),
+                (50, command(Command::Answer(Answer::Other))),
+            ],
+        );
+        assert_eq!(code, EXIT_REJECT);
+        assert_eq!(lines, [ASK_LINE, "info Not recognized."]);
+        assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+    }
+
+    #[test]
+    fn prompt_is_skipped_after_a_decision() {
+        let (code, lines, _, _) = run(
+            &prompt(OnNoDecision::Deny),
+            FakeFace::default(),
+            vec![
+                (0, fingerprint(Outcome::Match)),
+                (0, command(Command::Finish)),
+            ],
+        );
+        assert_eq!(code, EXIT_SUCCESS);
+        assert_eq!(lines, ["info Fingerprint recognized."]);
+    }
+
+    #[test]
+    fn prompt_abort_gives_no_decision() {
+        let (code, lines, _, _) = run(
+            &prompt(OnNoDecision::Deny),
+            FakeFace::default(),
+            vec![(0, command(Command::Finish)), (50, command(Command::Stop))],
+        );
+        assert_eq!(code, EXIT_NO_DECISION);
+        assert_eq!(lines, [ASK_LINE]);
     }
 
     #[test]

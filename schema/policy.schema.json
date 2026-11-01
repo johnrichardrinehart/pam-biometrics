@@ -82,6 +82,15 @@
           "$ref": "#/$defs/line",
           "pattern": "\\S"
         },
+        "after_password": {
+          "description": "What finish does after the password while no factor decided. wait: show wait_message and wait; on a terminal in line mode, a trigger line starts a face scan. prompt: ask once with after_password_prompt; the face trigger as the response starts a face scan; then wait.",
+          "enum": ["wait", "prompt"]
+        },
+        "after_password_prompt": {
+          "description": "The prompt of finish with after_password prompt. The default depends on the factors and face.trigger.",
+          "$ref": "#/$defs/line",
+          "pattern": "\\S"
+        },
         "fingerprint": {
           "type": "object",
           "additionalProperties": false,

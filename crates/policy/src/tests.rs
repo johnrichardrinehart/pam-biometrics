@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use crate::{
-    Combine, Error, FaceClass, FaceSettings, Factor, OnNoDecision, Outcome, Policy, Settings,
-    StepOutcome,
+    AfterPassword, Combine, Error, FaceClass, FaceSettings, Factor, OnNoDecision, Outcome, Policy,
+    Settings, StepOutcome,
 };
 
 fn parse(text: &str) -> Result<Policy, Error> {
@@ -22,6 +22,8 @@ fn built_in_defaults() {
     assert_eq!(settings.timeout_seconds, 15);
     assert_eq!(settings.password_prompt, None);
     assert_eq!(settings.wait_message, None);
+    assert_eq!(settings.after_password, AfterPassword::Wait);
+    assert_eq!(settings.after_password_prompt, None);
     assert_eq!(settings.fingerprint.max_tries, 3);
     assert!((settings.face.match_distance - 0.45).abs() < f64::EPSILON);
     assert!((settings.face.reject_distance - 0.6).abs() < f64::EPSILON);
@@ -145,6 +147,38 @@ fn prompts_and_trigger_resolve() {
 }
 
 #[test]
+fn after_password_resolves() {
+    let policy = parse(
+        r#"{
+          "version": 1,
+          "services": { "polkit-1": { "after_password": "prompt" } },
+          "users": {
+            "alice": {
+              "services": {
+                "polkit-1": { "after_password_prompt": "Press Enter: " },
+                "sudo": { "after_password": "prompt" }
+              }
+            },
+            "bob": { "services": { "polkit-1": { "after_password": "wait" } } }
+          }
+        }"#,
+    )
+    .unwrap();
+    let resolve = |service, user| {
+        let settings = policy.resolve(Some(service), Some(user));
+        (settings.after_password, settings.after_password_prompt)
+    };
+    assert_eq!(resolve("login", "carol"), (AfterPassword::Wait, None));
+    assert_eq!(resolve("polkit-1", "carol"), (AfterPassword::Prompt, None));
+    assert_eq!(
+        resolve("polkit-1", "alice"),
+        (AfterPassword::Prompt, Some("Press Enter: ".to_owned()))
+    );
+    assert_eq!(resolve("sudo", "alice"), (AfterPassword::Prompt, None));
+    assert_eq!(resolve("polkit-1", "bob"), (AfterPassword::Wait, None));
+}
+
+#[test]
 fn unknown_fields_are_errors() {
     for text in [
         r#"{"version": 1, "extra": true}"#,
@@ -161,6 +195,8 @@ fn unknown_fields_are_errors() {
         r#"{"version": 1, "defaults": {"prompt": "Touch the reader."}}"#,
         r#"{"version": 1, "defaults": {"finish_prompt": "Press Enter: "}}"#,
         r#"{"version": 1, "defaults": {"face": {"trigger": null}}}"#,
+        r#"{"version": 1, "defaults": {"after_password": "ask"}}"#,
+        r#"{"version": 1, "defaults": {"after_password": null}}"#,
     ] {
         assert!(
             matches!(parse(text), Err(Error::Parse { .. })),
@@ -212,6 +248,14 @@ fn layer_values_are_checked() {
         (
             r#"{"version": 1, "defaults": {"wait_message": "Touch\nthe reader."}}"#,
             "test: defaults: wait_message must not contain control characters",
+        ),
+        (
+            r#"{"version": 1, "defaults": {"after_password_prompt": " "}}"#,
+            "test: defaults: after_password_prompt must contain text",
+        ),
+        (
+            r#"{"version": 1, "defaults": {"after_password_prompt": "Press\nEnter: "}}"#,
+            "test: defaults: after_password_prompt must not contain control characters",
         ),
         (
             r#"{"version": 1, "defaults": {"face": {"trigger": "f\r"}}}"#,

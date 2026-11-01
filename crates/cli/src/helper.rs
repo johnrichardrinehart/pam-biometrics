@@ -18,16 +18,19 @@
 //! | `prompt TEXT`      | The first password prompt.                                  |
 //! | `reprompt TEXT`    | The password prompt after a face trigger. It differs from `prompt`. |
 //! | `trigger TEXT`     | The face trigger. Absent if the face factor is disabled.    |
+//! | `after-password prompt` | `finish` will send `ask`. The module then does not watch the terminal. Absent with `after_password: wait`. |
 //! | `ready`            | The end of the settings. The factors run.                   |
 //!
 //! Then the module sends commands:
 //!
-//! | Command  | Effect                                                                          |
-//! |----------|---------------------------------------------------------------------------------|
-//! | `scan`   | Start a face scan for the user.                                                 |
-//! | `state`  | The helper replies `state VERDICT FACE`.                                        |
-//! | `finish` | Wait for a decision until the timeout, then exit with the step exit code.      |
-//! | `stop`   | Stop the factors and exit. The end of the input does the same.                  |
+//! | Command          | Effect                                                                  |
+//! |------------------|-------------------------------------------------------------------------|
+//! | `scan`           | Start a face scan for the user.                                         |
+//! | `state`          | The helper replies `state VERDICT FACE`.                                |
+//! | `finish`         | Wait for a decision until the timeout, then exit with the step exit code. |
+//! | `answer trigger` | The reply to `ask`: the response was the face trigger.                 |
+//! | `answer other`   | The reply to `ask`: any other response.                                |
+//! | `stop`           | Stop the factors and exit. The end of the input does the same.          |
 //!
 //! The module may send `scan` during the wait of `finish`.
 //!
@@ -37,6 +40,7 @@
 //! |------------------------|-------------------------------------------------------------------------|
 //! | `info TEXT`            | A line for the user.                                                    |
 //! | `state VERDICT FACE`   | VERDICT is `success`, `reject`, or `pending`. FACE is `scanning` or `idle`. |
+//! | `ask TEXT`             | Only with `after_password: prompt`, once in `finish` before any wait: prompt with TEXT, then send `answer`. |
 //!
 //! The password never goes to the helper. The exit code gives the result of
 //! the step: 0 for a match, 10 for a reject, and 20 without a decision.
@@ -46,7 +50,7 @@ use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-use pam_biometrics_policy::{Combine, EXIT_NO_DECISION, Factor, Policy, Settings};
+use pam_biometrics_policy::{AfterPassword, Combine, EXIT_NO_DECISION, Factor, Policy, Settings};
 
 use crate::face::{Daemon, FaceTask};
 use crate::fingerprint::FingerprintTask;
@@ -124,6 +128,34 @@ pub fn wait_message(settings: &Settings) -> String {
     }
 }
 
+/// Returns the prompt of `finish` with `after_password: prompt`.
+#[must_use]
+pub fn after_password_prompt(settings: &Settings) -> String {
+    if let Some(prompt) = &settings.after_password_prompt {
+        return prompt.clone();
+    }
+    let trigger = &settings.face.trigger;
+    match (
+        settings.enabled(Factor::Fingerprint),
+        settings.enabled(Factor::Face),
+        settings.combine,
+    ) {
+        (true, true, Combine::Any) => format!(
+            "Touch the fingerprint reader or {} to scan your face (other text skips): ",
+            trigger_hint(trigger, false)
+        ),
+        (true, true, Combine::All) => format!(
+            "Touch the fingerprint reader and {} to scan your face (other text skips): ",
+            trigger_hint(trigger, false)
+        ),
+        (true, false, _) => "Touch the fingerprint reader, then press Enter: ".to_owned(),
+        _ => format!(
+            "{} to scan your face (other text skips): ",
+            trigger_hint(trigger, true)
+        ),
+    }
+}
+
 /// Returns the lines that the helper sends before the commands.
 #[must_use]
 pub fn greeting(settings: &Settings) -> Vec<String> {
@@ -137,6 +169,9 @@ pub fn greeting(settings: &Settings) -> Vec<String> {
     ];
     if settings.enabled(Factor::Face) {
         lines.push(format!("trigger {}", settings.face.trigger));
+    }
+    if settings.after_password == AfterPassword::Prompt {
+        lines.push("after-password prompt".to_owned());
     }
     lines.push("ready".to_owned());
     lines
@@ -249,7 +284,17 @@ pub fn run(policy_path: &Path, socket: &Path) -> i32 {
         .collect();
     drop(event_sender);
 
-    let code = Session::new(&settings, wait_message(&settings), inputs, daemon(), out).run();
+    let ask = (settings.after_password == AfterPassword::Prompt)
+        .then(|| after_password_prompt(&settings));
+    let code = Session::new(
+        &settings,
+        wait_message(&settings),
+        ask,
+        inputs,
+        daemon(),
+        out,
+    )
+    .run();
     for stop in stops {
         stop.stop();
     }
@@ -368,6 +413,53 @@ mod tests {
                 "ready"
             ]
         );
+        let mut prompt = settings(BOTH);
+        prompt.after_password = AfterPassword::Prompt;
+        assert_eq!(
+            greeting(&prompt),
+            [
+                "prompt Password (Enter to scan face): ",
+                "reprompt Password: ",
+                "trigger ",
+                "after-password prompt",
+                "ready"
+            ]
+        );
+    }
+
+    #[test]
+    fn default_after_password_prompts() {
+        let mut both = settings(BOTH);
+        assert_eq!(
+            after_password_prompt(&both),
+            "Touch the fingerprint reader or press Enter to scan your face (other text skips): "
+        );
+        both.face.trigger = "f".to_owned();
+        assert_eq!(
+            after_password_prompt(&both),
+            "Touch the fingerprint reader or type f to scan your face (other text skips): "
+        );
+        both.combine = Combine::All;
+        assert_eq!(
+            after_password_prompt(&both),
+            "Touch the fingerprint reader and type f to scan your face (other text skips): "
+        );
+        assert_eq!(
+            after_password_prompt(&settings(&[Factor::Fingerprint])),
+            "Touch the fingerprint reader, then press Enter: "
+        );
+        let mut face = settings(&[Factor::Face]);
+        assert_eq!(
+            after_password_prompt(&face),
+            "Press Enter to scan your face (other text skips): "
+        );
+        face.face.trigger = "f".to_owned();
+        assert_eq!(
+            after_password_prompt(&face),
+            "Type f to scan your face (other text skips): "
+        );
+        face.after_password_prompt = Some("Press Enter for the camera: ".to_owned());
+        assert_eq!(after_password_prompt(&face), "Press Enter for the camera: ");
     }
 
     #[test]

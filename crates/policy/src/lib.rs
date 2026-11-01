@@ -14,8 +14,8 @@ pub use decision::{
 };
 pub use policy::{DEFAULT_POLICY_PATH, Error, POLICY_VERSION, Policy, UserPolicy};
 pub use settings::{
-    Combine, FaceLayer, FaceSettings, Factor, FingerprintLayer, FingerprintSettings, Layer,
-    OnNoDecision, Settings,
+    AfterPassword, Combine, FaceLayer, FaceSettings, Factor, FingerprintLayer, FingerprintSettings,
+    Layer, OnNoDecision, Settings,
 };
 
 #[cfg(test)]

@@ -21,10 +21,9 @@
 //! returns `PAM_IGNORE`. Without an enabled factor, `start` asks nothing
 //! and returns `PAM_IGNORE`.
 //!
-//! `finish` uses the session of `start`, or starts one. It never asks a
-//! question. It shows the lines of the helper as information messages while
-//! the helper waits for a decision, and maps the exit code of the helper to
-//! the result:
+//! `finish` uses the session of `start`, or starts one. It shows the lines
+//! of the helper as information messages while the helper waits for a
+//! decision, and maps the exit code of the helper to the result:
 //!
 //! | Exit status | Meaning             | Result         |
 //! |-------------|---------------------|----------------|
@@ -32,13 +31,18 @@
 //! | 10          | A reject.           | `PAM_AUTH_ERR` |
 //! | other       | No decision.        | `PAM_IGNORE`   |
 //!
-//! During the wait, `finish` also reads lines from `PAM_TTY` if it is a
-//! terminal in line mode (`ICANON`), for example under `login`, `sudo`, or
-//! `su`. A line equal to the face trigger starts a face scan. Other lines
-//! are discarded. The module opens the terminal read-only and non-blocking,
-//! never changes its settings, never reads it outside the wait or without
-//! `ICANON`, and closes it before `finish` returns. Nothing read from the
-//! terminal is used as a secret: a line only selects whether to scan.
+//! With the policy value `after_password: prompt`, the helper asks for one
+//! prompt before the wait. The face trigger as the response starts a face
+//! scan. A conversation error gives `PAM_CONV_ERR`.
+//!
+//! With `after_password: wait`, `finish` asks nothing. During the wait it
+//! reads lines from `PAM_TTY` if it is a terminal in line mode (`ICANON`),
+//! for example under `login`, `sudo`, or `su`. A line equal to the face
+//! trigger starts a face scan. Other lines are discarded. The module opens
+//! the terminal read-only and non-blocking, never changes its settings,
+//! never reads it outside the wait or without `ICANON`, and closes it
+//! before `finish` returns. Nothing read from the terminal is used as a
+//! secret: a line only selects whether to scan.
 //!
 //! A crash of the helper or of this module gives no decision, so that a
 //! fault cannot lock the user out. The password stays necessary in the rest
@@ -318,8 +322,10 @@ enum Message<'a> {
     Prompt(&'a [u8]),
     Reprompt(&'a [u8]),
     Trigger(&'a [u8]),
+    AfterPasswordPrompt,
     Ready,
     Info(&'a [u8]),
+    Ask(&'a [u8]),
     Unknown,
 }
 
@@ -334,11 +340,22 @@ impl<'a> Message<'a> {
             b"prompt" => Self::Prompt(text),
             b"reprompt" => Self::Reprompt(text),
             b"trigger" => Self::Trigger(text),
+            b"after-password" if text == b"prompt" => Self::AfterPasswordPrompt,
             b"ready" => Self::Ready,
             b"info" => Self::Info(text),
+            b"ask" => Self::Ask(text),
             _ => Self::Unknown,
         }
     }
+}
+
+/// How [`Session::finish`] ended.
+#[derive(Debug)]
+enum Finished {
+    /// The helper exited, or waitpid failed.
+    Exited(io::Result<ExitStatus>),
+    /// The application gave no response to the prompt of `finish`.
+    ConversationError,
 }
 
 /// Returns the device of a `PAM_TTY` value: `/dev/NAME` for a relative name
@@ -499,6 +516,8 @@ struct Greeting {
     reprompt: CString,
     /// `None` if the face factor is disabled.
     trigger: Option<Vec<u8>>,
+    /// `finish` prompts once instead of watching the terminal.
+    prompt_after: bool,
 }
 
 /// A running helper.
@@ -542,6 +561,7 @@ impl Session {
                 prompt: CString::default(),
                 reprompt: CString::default(),
                 trigger: None,
+                prompt_after: false,
             },
             abandoned: false,
         };
@@ -562,7 +582,8 @@ impl Session {
                 Message::Reprompt(text) => reprompt = CString::new(text).ok(),
                 Message::Trigger(text) => session.greeting.trigger = Some(text.to_vec()),
                 Message::Ready => break,
-                Message::Info(_) | Message::Unknown => {}
+                Message::AfterPasswordPrompt => session.greeting.prompt_after = true,
+                Message::Info(_) | Message::Ask(_) | Message::Unknown => {}
             }
         }
         match (prompt, reprompt) {
@@ -686,18 +707,32 @@ impl Session {
     }
 
     /// Lets the helper wait for a decision after the password module, and
-    /// shows its lines meanwhile. A trigger line on `tty` starts a face
-    /// scan. Returns the exit status of the helper.
-    fn finish(
-        &mut self,
-        conversation: &mut dyn Conversation,
-        mut tty: Option<Tty>,
-    ) -> io::Result<ExitStatus> {
+    /// shows its lines meanwhile. Answers an `ask` of the helper with one
+    /// prompt. A trigger line on `tty` starts a face scan.
+    fn finish(&mut self, conversation: &mut dyn Conversation, mut tty: Option<Tty>) -> Finished {
         self.send(b"finish\n");
         loop {
             while let Some(line) = self.buffered_line() {
-                if let Message::Info(text) = Message::parse(&line) {
-                    conversation.info(text);
+                match Message::parse(&line) {
+                    Message::Info(text) => conversation.info(text),
+                    Message::Ask(text) => {
+                        let Some(response) = CString::new(text)
+                            .ok()
+                            .and_then(|prompt| conversation.ask(&prompt))
+                        else {
+                            return Finished::ConversationError;
+                        };
+                        let trigger =
+                            is_trigger(self.greeting.trigger.as_deref(), response.bytes());
+                        drop(response);
+                        if trigger {
+                            conversation.info(SCANNING);
+                            self.send(b"answer trigger\n");
+                        } else {
+                            self.send(b"answer other\n");
+                        }
+                    }
+                    _ => {}
                 }
             }
             let mut descriptors = [
@@ -732,7 +767,7 @@ impl Session {
             }
         }
         drop(tty);
-        self.child.wait()
+        Finished::Exited(self.child.wait())
     }
 
     /// Waits up to `timeout` for the helper to end. Returns true if it
@@ -904,16 +939,14 @@ unsafe fn authenticate(pamh: *mut PamHandle, argc: c_int, argv: *const *const c_
             let Some(session) = session else {
                 return PAM_IGNORE;
             };
-            // Only a face trigger can come from the terminal.
-            let tty = session
-                .greeting
-                .trigger
-                .is_some()
+            // Only a face trigger can come from the terminal, and only
+            // `after_password: wait` watches it.
+            let tty = (session.greeting.trigger.is_some() && !session.greeting.prompt_after)
                 // SAFETY: `pamh` is valid.
                 .then(|| unsafe { terminal(pamh) })
                 .flatten();
             let result = match session.finish(&mut conversation, tty) {
-                Ok(status) => {
+                Finished::Exited(Ok(status)) => {
                     let result = pam_result(status.code());
                     if result == PAM_IGNORE {
                         log(
@@ -924,10 +957,11 @@ unsafe fn authenticate(pamh: *mut PamHandle, argc: c_int, argv: *const *const c_
                     }
                     result
                 }
-                Err(error) => {
+                Finished::Exited(Err(error)) => {
                     log(pamh, LOG_ERR, &format!("waitpid: {error}"));
                     PAM_IGNORE
                 }
+                Finished::ConversationError => PAM_CONV_ERR,
             };
             // SAFETY: `pamh` is valid. `session` is no longer used.
             unsafe { remove(pamh) };
@@ -1131,8 +1165,12 @@ mod tests {
             Message::parse(b"info Face recognized."),
             Message::Info(b"Face recognized.")
         );
-        // `finish` asks nothing, so `ask` is not a message any more.
-        assert_eq!(Message::parse(b"ask Touch: "), Message::Unknown);
+        assert_eq!(Message::parse(b"ask Touch: "), Message::Ask(b"Touch: "));
+        assert_eq!(
+            Message::parse(b"after-password prompt"),
+            Message::AfterPasswordPrompt
+        );
+        assert_eq!(Message::parse(b"after-password wait"), Message::Unknown);
         assert_eq!(Message::parse(b"state pending idle"), Message::Unknown);
         assert_eq!(Message::parse(b""), Message::Unknown);
     }
@@ -1404,7 +1442,7 @@ exit 0"#
             std::thread::sleep(Duration::from_secs(2));
         });
         let mut conversation = Script::new(&[]);
-        let status = session.finish(&mut conversation, Some(tty)).unwrap();
+        let status = exited(session.finish(&mut conversation, Some(tty)));
         assert_eq!(pam_result(status.code()), PAM_SUCCESS);
         assert_eq!(
             conversation.infos,
@@ -1422,7 +1460,7 @@ echo 'info Face not recognized.'; echo 'info Not recognized.'; exit 10"
         );
         let mut session = start_helper(&script);
         let mut conversation = Script::new(&[]);
-        let status = session.finish(&mut conversation, None).unwrap();
+        let status = exited(session.finish(&mut conversation, None));
         assert_eq!(pam_result(status.code()), PAM_AUTH_ERR);
         assert_eq!(
             conversation.infos,
@@ -1431,15 +1469,86 @@ echo 'info Face not recognized.'; echo 'info Not recognized.'; exit 10"
         assert!(conversation.prompts.is_empty());
 
         let mut session = start_helper(&format!("{GREETING}; read -r command; exit 20"));
-        let status = session.finish(&mut Script::new(&[]), None).unwrap();
+        let status = exited(session.finish(&mut Script::new(&[]), None));
         assert_eq!(pam_result(status.code()), PAM_IGNORE);
     }
 
     #[test]
     fn finish_after_a_crash_gives_no_decision() {
         let mut session = start_helper(&format!("{GREETING}; read -r command; kill -9 $$"));
-        let status = session.finish(&mut Script::new(&[]), None).unwrap();
+        let status = exited(session.finish(&mut Script::new(&[]), None));
         assert_eq!(pam_result(status.code()), PAM_IGNORE);
+    }
+
+    fn exited(finished: Finished) -> ExitStatus {
+        match finished {
+            Finished::Exited(status) => status.unwrap(),
+            Finished::ConversationError => panic!("conversation error"),
+        }
+    }
+
+    /// A helper with `after_password: prompt` that asks once, echoes the
+    /// answer, and exits with `code`.
+    fn asking_helper(code: u8) -> Session {
+        let session = start_helper(&format!(
+            r#"printf 'prompt Password (Enter to scan face): \nreprompt Password: \ntrigger \nafter-password prompt\nready\n'
+read -r command; echo 'info Fingerprint not recognized. Try again.'
+echo 'ask Touch the fingerprint reader or press Enter to scan your face (other text skips): '
+read -r answer; echo "info got $answer"; exit {code}"#
+        ));
+        assert!(session.greeting.prompt_after);
+        session
+    }
+
+    #[test]
+    fn finish_answers_the_prompt_with_the_trigger() {
+        let mut session = asking_helper(0);
+        let mut conversation = Script::new(&[""]);
+        let status = exited(session.finish(&mut conversation, None));
+        assert_eq!(pam_result(status.code()), PAM_SUCCESS);
+        assert_eq!(
+            conversation.prompts,
+            ["Touch the fingerprint reader or press Enter to scan your face (other text skips): "]
+        );
+        assert_eq!(
+            conversation.infos,
+            [
+                "Fingerprint not recognized. Try again.",
+                "Scanning face…",
+                "got answer trigger"
+            ]
+        );
+    }
+
+    #[test]
+    fn finish_answers_the_prompt_with_other_text() {
+        let mut session = asking_helper(20);
+        let mut conversation = Script::new(&["skip"]);
+        let status = exited(session.finish(&mut conversation, None));
+        assert_eq!(pam_result(status.code()), PAM_IGNORE);
+        assert_eq!(
+            conversation.infos,
+            ["Fingerprint not recognized. Try again.", "got answer other"]
+        );
+    }
+
+    #[test]
+    fn finish_prompt_conversation_error() {
+        let mut session = asking_helper(0);
+        assert!(matches!(
+            session.finish(&mut Script::new(&[]), None),
+            Finished::ConversationError
+        ));
+        // Dropping the session stops the helper.
+        let pid = session.child.id();
+        drop(session);
+        assert!(gone(pid));
+    }
+
+    #[test]
+    fn greeting_without_the_prompt_mode() {
+        let session = start_helper(&format!("{GREETING}; {ECHO}"));
+        assert!(!session.greeting.prompt_after);
     }
 
     #[test]

@@ -130,12 +130,16 @@ in
 
               `start` asks for the password and gives it to `pam_unix`
               through `try_first_pass`. The face trigger as a response
-              starts a face scan. `finish` asks nothing: a match or a
-              reject so far decides at once, otherwise it shows
-              `wait_message` and waits up to `timeout_seconds` for a
-              finger or a face, then `on_no_decision` applies. On a
-              terminal in line mode, the face trigger typed during the
-              wait starts a scan. The last line is optional.
+              starts a face scan. In `finish`, a match or a reject so far
+              decides at once. Otherwise, with the policy value
+              `after_password = "wait"` (the default), `finish` asks
+              nothing, shows `wait_message`, and watches a terminal in
+              line mode for the face trigger. With
+              `after_password = "prompt"`, for example for `polkit-1`,
+              `finish` asks once with `after_password_prompt`; the trigger
+              as the answer starts a face scan. Then `finish` waits up to
+              `timeout_seconds` for a finger or a face, and
+              `on_no_decision` applies. The last line is optional.
             '';
           };
       in

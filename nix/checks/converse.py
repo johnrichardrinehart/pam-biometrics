@@ -1,10 +1,11 @@
 """Drive one pamtester authentication through a terminal.
 
-Usage: converse SERVICE USER STEP...
+Usage: converse [--no-tty] SERVICE USER STEP...
 
 A step "?TEXT" waits for TEXT in the output. A step "!TEXT" types TEXT and
 Enter. A step "=PATH" waits until the file PATH exists. The script prints
-the output and exits with the status of pamtester.
+the output and exits with the status of pamtester. With --no-tty, PAM_TTY
+stays unset, as under the socket-activated polkit agent helper.
 """
 
 import io
@@ -16,12 +17,15 @@ import pexpect
 
 
 def main():
-    service, user, *steps = sys.argv[1:]
+    arguments = sys.argv[1:]
+    no_tty = arguments[:1] == ["--no-tty"]
+    service, user, *steps = arguments[1:] if no_tty else arguments
     output = io.StringIO()
     # pamtester sets PAM_TTY only on request. The terminal is the pty that
     # pexpect gives to pamtester, so that pam_biometrics.so finish can read
     # trigger lines from it.
-    command = 'exec pamtester -I "tty=$(tty)" "$0" "$1" authenticate'
+    item = "" if no_tty else '-I "tty=$(tty)" '
+    command = "exec pamtester " + item + '"$0" "$1" authenticate'
     child = pexpect.spawn(
         "sh",
         ["-c", command, service, user],

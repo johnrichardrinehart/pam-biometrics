@@ -57,6 +57,8 @@ fn resolved_settings_are_a_valid_layer() {
     let mut prompted = Settings {
         password_prompt: Some("Password (type f to scan face): ".to_owned()),
         wait_message: Some("Type f to scan your face.".to_owned()),
+        after_password: pam_biometrics_policy::AfterPassword::Prompt,
+        after_password_prompt: Some("Type f to scan your face: ".to_owned()),
         ..Settings::default()
     };
     prompted.face.trigger = "f".to_owned();
@@ -84,6 +86,9 @@ fn schema_and_types_reject_the_same_documents() {
         json!({ "version": 1, "defaults": { "finish_prompt": "Press Enter: " } }),
         json!({ "version": 1, "defaults": { "wait_message": "" } }),
         json!({ "version": 1, "defaults": { "wait_message": "Press\tEnter." } }),
+        json!({ "version": 1, "defaults": { "after_password": "ask" } }),
+        json!({ "version": 1, "defaults": { "after_password_prompt": "" } }),
+        json!({ "version": 1, "defaults": { "after_password_prompt": "a\nb: " } }),
         json!({ "version": 1, "defaults": { "face": { "trigger": "f\n" } } }),
         json!({ "version": 1, "defaults": { "face": { "trigger": 1 } } }),
         json!({ "version": 1, "defaults": { "fingerprint": { "max_tries": 0 } } }),

@@ -95,6 +95,12 @@ testers.runNixOSTest {
               timeout_seconds = 15;
             };
             test-rescan.timeout_seconds = 40;
+            # As for run0: no terminal, so finish prompts once.
+            test-prompt = {
+              after_password = "prompt";
+              # Longer than a full scan of a stranger, with some margin.
+              timeout_seconds = 10;
+            };
           };
         };
       };
@@ -111,6 +117,7 @@ testers.runNixOSTest {
             "test-scan"
             "test-trigger"
             "test-rescan"
+            "test-prompt"
           ]
           (_: {
             text = ''
@@ -162,9 +169,11 @@ testers.runNixOSTest {
         machine.fail("pgrep -f 'pam-biometrics pam-[s]ession'")
 
 
-    def converse(service, *steps):
-        """Authenticate alice through a terminal. See converse.py."""
-        command = shlex.join(["converse", service, "alice", *steps])
+    def converse(service, *steps, tty=True):
+        """Authenticate alice through a terminal. See converse.py. Without
+        tty, PAM_TTY stays unset."""
+        options = [] if tty else ["--no-tty"]
+        command = shlex.join(["converse", *options, service, "alice", *steps])
         start = time.monotonic()
         status, output = machine.execute(command)
         elapsed = time.monotonic() - start
@@ -330,6 +339,40 @@ testers.runNixOSTest {
         status, output, _ = converse("test-trigger", trigger_prompt, "!")
         assert status == 1, output
         assert "Scanning face" not in output, output
+
+    with subtest("after_password prompt: Enter at the prompt scans the face"):
+        ask = "Touch the fingerprint reader or press Enter to scan your face (other text skips): "
+        status, output, elapsed = converse(
+            "test-prompt", PROMPT, PASSWORD, "?" + ask, "!", tty=False
+        )
+        assert status == 0, output
+        assert "Scanning face" in output, output
+        assert "Face recognized." in output, output
+        # The ask text starts like the wait message. The wait message ends
+        # with the seconds.
+        assert WAIT + " (10 s)." not in output, output
+        assert "successfully authenticated" in output, output
+        assert elapsed < 10, elapsed
+
+    with subtest("after_password prompt: other text waits, then passes with allow"):
+        status, output, elapsed = converse(
+            "test-prompt", PROMPT, PASSWORD, "?" + ask, "!skip", tty=False
+        )
+        assert status == 0, output
+        assert "Scanning face" not in output, output
+        assert WAIT + " (10 s)." in output, output
+        assert "successfully authenticated" in output, output
+        assert elapsed >= 10, elapsed
+
+    with subtest("after_password prompt: a stranger after Enter gives AUTH_ERR"):
+        show("${images.biden-top}")
+        status, output, _ = converse(
+            "test-prompt", PROMPT, PASSWORD, "?" + ask, "!", tty=False
+        )
+        assert status == 1, output
+        assert "Face not recognized." in output, output
+        assert "Not recognized." in output, output
+        assert "Authentication failure" in output, output
 
     with subtest("an empty factor list leaves the prompt to pam_unix"):
         status, output, elapsed = converse("test-none", "?Password: ", PASSWORD)

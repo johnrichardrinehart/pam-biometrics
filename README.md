@@ -68,9 +68,20 @@ One call of `pam_authenticate` runs these steps:
    ends the attempt. `pam_end` then stops the helper.
 4. `finish` decides with the outcomes so far. A reject decides at once and
    wins over a match. A match without a reject also decides at once.
-   Otherwise `finish` shows `wait_message` and waits until a match or a
-   reject, at most `timeout_seconds` from its start. Without a decision,
-   `on_no_decision` applies. `finish` never asks a question.
+   Otherwise `after_password` selects what happens next:
+   - `wait`, the default: `finish` shows `wait_message` and asks nothing.
+     On a terminal in line mode, the face trigger typed during the wait
+     starts a face scan.
+   - `prompt`: `finish` asks once with `after_password_prompt`. A finger or
+     a face that matches or rejects while the prompt is open decides as
+     soon as the user answers. The face trigger as the answer starts a face
+     scan. Any other answer shows `wait_message`. A conversation error
+     gives `PAM_CONV_ERR`.
+
+   Then `finish` waits until a match or a reject, at most
+   `timeout_seconds` from its start. The fingerprint counts during the
+   whole wait. Without a decision, `on_no_decision` applies.
+
 5. `finish` stops the helper.
 
 A user can thus give the finger or the face before the password, at the
@@ -81,11 +92,11 @@ example `Fingerprint recognized.` or `Face not certain. Scan again.`.
 
 ### Face trigger during the wait
 
-During the wait, `finish` reads lines from the terminal of the application
-if `PAM_TTY` names a terminal in line mode (`ICANON`). That is the case for
-`login`, `sudo`, and `su` on a terminal. A line equal to `face.trigger`
-starts a face scan. With the default trigger, that is Enter alone. The
-module discards other lines.
+With `"after_password": "wait"`, `finish` reads lines from the terminal of
+the application during the wait if `PAM_TTY` names a terminal in line mode
+(`ICANON`). That is the case for `login`, `sudo`, and `su` on a terminal. A
+line equal to `face.trigger` starts a face scan. With the default trigger,
+that is Enter alone. The module discards other lines.
 
 - `PAM_TTY` can be a name such as `tty1` or `pts/3`, or a path under
   `/dev/`. Other values, such as an X display `:0`, mean no terminal.
@@ -98,6 +109,12 @@ module discards other lines.
   is a secret: a line only decides whether to start a scan. The password
   comes from the prompt of `start`.
 - Graphical clients have no terminal. A key binding starts a scan there.
+- polkit 127 runs `polkit-agent-helper-1` socket-activated, without a
+  terminal and without `PAM_TTY`, so polkit authentications such as `run0`
+  have no trigger during the wait. Set `"after_password": "prompt"` for the
+  `polkit-1` service: the agent then shows the prompt of `finish`, and
+  Enter there starts a scan. With `prompt`, the module never opens
+  `PAM_TTY`.
 
 The factors run like this:
 
@@ -143,29 +160,33 @@ lines. The password never goes to the helper.
 
 The helper sends its settings first:
 
-| Line            | Meaning                                                                         |
-| --------------- | ------------------------------------------------------------------------------- |
-| `off`           | No factor is enabled. The helper exits.                                         |
-| `prompt TEXT`   | The first password prompt.                                                      |
-| `reprompt TEXT` | The password prompt after a face trigger. It differs from `prompt`.             |
-| `trigger TEXT`  | The face trigger. An empty text is Enter alone. Absent without the face factor. |
-| `ready`         | The end of the settings. The factors run.                                       |
+| Line                    | Meaning                                                                                                      |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `off`                   | No factor is enabled. The helper exits.                                                                      |
+| `prompt TEXT`           | The first password prompt.                                                                                   |
+| `reprompt TEXT`         | The password prompt after a face trigger. It differs from `prompt`.                                          |
+| `trigger TEXT`          | The face trigger. An empty text is Enter alone. Absent without the face factor.                              |
+| `after-password prompt` | `finish` will send `ask`, so the module does not watch the terminal. Absent with `"after_password": "wait"`. |
+| `ready`                 | The end of the settings. The factors run.                                                                    |
 
 Then the module sends commands:
 
-| Command  | Effect                                                                  |
-| -------- | ----------------------------------------------------------------------- |
-| `scan`   | Start a face scan for the user. Also valid during the wait of `finish`. |
-| `state`  | The helper replies `state VERDICT FACE`.                                |
-| `finish` | Wait for a decision until the timeout, then exit with the exit code.    |
-| `stop`   | Stop the factors and exit. The end of the input does the same.          |
+| Command          | Effect                                                                  |
+| ---------------- | ----------------------------------------------------------------------- |
+| `scan`           | Start a face scan for the user. Also valid during the wait of `finish`. |
+| `state`          | The helper replies `state VERDICT FACE`.                                |
+| `finish`         | Wait for a decision until the timeout, then exit with the exit code.    |
+| `answer trigger` | The reply to `ask`: the response was the face trigger.                  |
+| `answer other`   | The reply to `ask`: any other response.                                 |
+| `stop`           | Stop the factors and exit. The end of the input does the same.          |
 
 The helper sends these lines at any time:
 
-| Line                 | Meaning                                                                         |
-| -------------------- | ------------------------------------------------------------------------------- |
-| `info TEXT`          | A line for the user.                                                            |
-| `state VERDICT FACE` | `VERDICT` is `success`, `reject`, or `pending`. `FACE` is `scanning` or `idle`. |
+| Line                 | Meaning                                                                                                                      |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `info TEXT`          | A line for the user.                                                                                                         |
+| `state VERDICT FACE` | `VERDICT` is `success`, `reject`, or `pending`. `FACE` is `scanning` or `idle`.                                              |
+| `ask TEXT`           | Only with `"after_password": "prompt"`, once in `finish` before the wait. The module prompts with `TEXT` and sends `answer`. |
 
 `finish` sends the wait message as an `info` line when it starts to wait.
 
@@ -346,8 +367,8 @@ The control values have this effect:
 - `ignore=ignore`: without a decision, the other modules decide. `start`
   always gives `PAM_IGNORE` after the password.
 - `default=die`: a reject ends the attempt with a failure. So does an
-  aborted conversation at the prompt of `start`, which gives
-  `PAM_CONV_ERR`.
+  aborted conversation at the prompt of `start`, or at the prompt of
+  `finish` with `"after_password": "prompt"`, which gives `PAM_CONV_ERR`.
 
 The first module argument selects the mode, `start` or `finish`. Without
 one of them, the module runs `finish`, so one line after the password
@@ -363,11 +384,15 @@ The applications differ in how they show the prompts:
   triggers in one attempt, every response is the password.
 - `sudo` shows its own `[sudo] password for USER:` prompt instead of the
   PAM prompt `Password: `. It shows the other prompts as they are.
-- `finish` asks nothing, so every application can wait through it. The
-  application may show the wait message and the other information
-  messages in its own way, or not at all.
+- With `"after_password": "wait"`, `finish` asks nothing, so every
+  application can wait through it. The application may show the wait
+  message and the other information messages in its own way, or not at
+  all.
 - Only applications that set `PAM_TTY` to a terminal in line mode get the
-  face trigger during the wait. Elsewhere, a key binding starts a scan.
+  face trigger during that wait. Elsewhere, a key binding starts a scan,
+  or `"after_password": "prompt"` gives the user one prompt to press Enter
+  at. An application that answers every hidden prompt with the password
+  skips that prompt: the answer is not the trigger, so `finish` just waits.
 
 ## Key binding
 
@@ -542,7 +567,8 @@ built-in defaults apply. Unknown fields are errors. The schema is
   },
   "services": {
     "sudo": { "factors": ["fingerprint", "face"] },
-    "greetd": { "timeout_seconds": 20, "face": { "trigger": "f" } }
+    "greetd": { "timeout_seconds": 20, "face": { "trigger": "f" } },
+    "polkit-1": { "after_password": "prompt" }
   },
   "users": {
     "john": {
@@ -569,19 +595,21 @@ Lists replace the list of the earlier layer. Objects merge field by field.
 
 ### Fields
 
-| Field                    | Type                          | Default                   | Meaning                                                                                                                                   |
-| ------------------------ | ----------------------------- | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `factors`                | list of `fingerprint`, `face` | `["fingerprint", "face"]` | The enabled factors. An empty list gives `no_decision` at once and ignores `on_no_decision`.                                              |
-| `combine`                | `any` or `all`                | `any`                     | How the steps combine the factor outcomes.                                                                                                |
-| `on_no_decision`         | `allow` or `deny`             | `allow`                   | `allow` gives `PAM_IGNORE`. `deny` gives `PAM_AUTH_ERR`.                                                                                  |
-| `timeout_seconds`        | integer, 1 or more            | `15`                      | The wait of `finish` for a finger or a face after the password, from the start of `finish`.                                               |
-| `password_prompt`        | one line of text              | depends on the factors    | The first password prompt of `start`.                                                                                                     |
-| `wait_message`           | one line of text              | depends on the factors    | The information message that `finish` shows when it waits.                                                                                |
-| `fingerprint.max_tries`  | integer, 1 or more            | `3`                       | Wrong fingers before a reject.                                                                                                            |
-| `face.match_distance`    | number above 0                | `0.45`                    | A best distance at or below this value is a match.                                                                                        |
-| `face.reject_distance`   | number above 0                | `0.6`                     | A best distance above this value can reject. It must not be below `match_distance`.                                                       |
-| `face.min_reject_frames` | integer, 1 or more            | `3`                       | A reject needs a face in this many frames.                                                                                                |
-| `face.trigger`           | one line of text              | `""`                      | The response to the password prompt, or the line on the terminal during the wait, that starts a face scan. The empty text is Enter alone. |
+| Field                    | Type                          | Default                   | Meaning                                                                                                                                       |
+| ------------------------ | ----------------------------- | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `factors`                | list of `fingerprint`, `face` | `["fingerprint", "face"]` | The enabled factors. An empty list gives `no_decision` at once and ignores `on_no_decision`.                                                  |
+| `combine`                | `any` or `all`                | `any`                     | How the steps combine the factor outcomes.                                                                                                    |
+| `on_no_decision`         | `allow` or `deny`             | `allow`                   | `allow` gives `PAM_IGNORE`. `deny` gives `PAM_AUTH_ERR`.                                                                                      |
+| `timeout_seconds`        | integer, 1 or more            | `15`                      | The wait of `finish` for a finger or a face after the password, from the start of `finish`.                                                   |
+| `password_prompt`        | one line of text              | depends on the factors    | The first password prompt of `start`.                                                                                                         |
+| `wait_message`           | one line of text              | depends on the factors    | The information message that `finish` shows when it waits.                                                                                    |
+| `after_password`         | `wait` or `prompt`            | `wait`                    | `wait`: `finish` asks nothing and watches a terminal in line mode for the trigger. `prompt`: `finish` asks once with `after_password_prompt`. |
+| `after_password_prompt`  | one line of text              | depends on the factors    | The prompt of `finish` with `"after_password": "prompt"`.                                                                                     |
+| `fingerprint.max_tries`  | integer, 1 or more            | `3`                       | Wrong fingers before a reject.                                                                                                                |
+| `face.match_distance`    | number above 0                | `0.45`                    | A best distance at or below this value is a match.                                                                                            |
+| `face.reject_distance`   | number above 0                | `0.6`                     | A best distance above this value can reject. It must not be below `match_distance`.                                                           |
+| `face.min_reject_frames` | integer, 1 or more            | `3`                       | A reject needs a face in this many frames.                                                                                                    |
+| `face.trigger`           | one line of text              | `""`                      | The response to the password prompt, or the line on the terminal during the wait, that starts a face scan. The empty text is Enter alone.     |
 
 The prompts, the message, and the trigger cannot contain line breaks or
 other control characters. Without the face factor, the trigger means
@@ -592,17 +620,18 @@ The defaults depend on the factors, on `face.trigger`, and on
 trigger, and for `type f` with the trigger `f`. `N` stands for
 `timeout_seconds`:
 
-| Factors          | `password_prompt`                 | `wait_message`                                                      |
-| ---------------- | --------------------------------- | ------------------------------------------------------------------- |
-| both, `any`      | `Password (Enter to scan face): ` | `Touch the fingerprint reader or TRIGGER to scan your face (N s).`  |
-| both, `all`      | `Password (Enter to scan face): ` | `Touch the fingerprint reader and TRIGGER to scan your face (N s).` |
-| fingerprint only | `Password: `                      | `Touch the fingerprint reader (N s).`                               |
-| face only        | `Password (Enter to scan face): ` | `TRIGGER to scan your face (N s).`, with a capital letter           |
+| Factors          | `password_prompt`                 | `wait_message`                                                      | `after_password_prompt`                                                           |
+| ---------------- | --------------------------------- | ------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| both, `any`      | `Password (Enter to scan face): ` | `Touch the fingerprint reader or TRIGGER to scan your face (N s).`  | `Touch the fingerprint reader or TRIGGER to scan your face (other text skips): `  |
+| both, `all`      | `Password (Enter to scan face): ` | `Touch the fingerprint reader and TRIGGER to scan your face (N s).` | `Touch the fingerprint reader and TRIGGER to scan your face (other text skips): ` |
+| fingerprint only | `Password: `                      | `Touch the fingerprint reader (N s).`                               | `Touch the fingerprint reader, then press Enter: `                                |
+| face only        | `Password (Enter to scan face): ` | `TRIGGER to scan your face (N s).`, with a capital letter           | `TRIGGER to scan your face (other text skips): `, with a capital letter           |
 
 With a non-empty trigger, the default password prompt is
 `Password (type f to scan face): `. After a trigger, `start` asks with
 `Password: `, or with `Password (face scan started): ` if the first prompt
-is `Password: `. A custom `wait_message` appears as it is.
+is `Password: `. A custom `wait_message` or `after_password_prompt` appears
+as it is.
 
 ### Semantics
 

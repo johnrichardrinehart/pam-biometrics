@@ -53,6 +53,19 @@ pub enum OnNoDecision {
     Deny,
 }
 
+/// What `finish` does after the password while no factor decided.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AfterPassword {
+    /// Show the wait message and wait. On a terminal in line mode, a
+    /// trigger line starts a face scan.
+    #[default]
+    Wait,
+    /// Ask once with the after-password prompt. The face trigger as the
+    /// response starts a face scan. Then wait.
+    Prompt,
+}
+
 /// Resolved settings of the fingerprint factor.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -99,6 +112,12 @@ pub struct Settings {
     /// trigger, and the timeout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_message: Option<String>,
+    /// What `finish` does after the password while no factor decided.
+    pub after_password: AfterPassword,
+    /// The prompt of `finish` with `after_password: prompt`. `None` gives a
+    /// text that depends on the factors and the face trigger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_password_prompt: Option<String>,
     /// Fingerprint settings.
     pub fingerprint: FingerprintSettings,
     /// Face settings.
@@ -114,6 +133,8 @@ impl Default for Settings {
             timeout_seconds: 15,
             password_prompt: None,
             wait_message: None,
+            after_password: AfterPassword::Wait,
+            after_password_prompt: None,
             fingerprint: FingerprintSettings { max_tries: 3 },
             face: FaceSettings {
                 match_distance: 0.45,
@@ -145,6 +166,12 @@ impl Settings {
         }
         if let Some(message) = &layer.wait_message {
             self.wait_message = Some(message.clone());
+        }
+        if let Some(mode) = layer.after_password {
+            self.after_password = mode;
+        }
+        if let Some(prompt) = &layer.after_password_prompt {
+            self.after_password_prompt = Some(prompt.clone());
         }
         if let Some(fingerprint) = &layer.fingerprint
             && let Some(max_tries) = fingerprint.max_tries
@@ -230,6 +257,20 @@ pub struct Layer {
         skip_serializing_if = "Option::is_none"
     )]
     pub wait_message: Option<String>,
+    /// See [`Settings::after_password`].
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub after_password: Option<AfterPassword>,
+    /// See [`Settings::after_password_prompt`].
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub after_password_prompt: Option<String>,
     /// See [`Settings::fingerprint`].
     #[serde(
         default,

@@ -85,6 +85,7 @@ const PAM_TEXT_INFO: c_int = 4;
 const PAM_DATA_SILENT: c_int = 0x4000_0000;
 const LOG_ERR: c_int = 3;
 const LOG_WARNING: c_int = 4;
+const LOG_DEBUG: c_int = 7;
 
 const HELPER_MATCH: i32 = 0;
 const HELPER_REJECT: i32 = 10;
@@ -409,6 +410,10 @@ fn take_lines(pending: &mut Vec<u8>) -> Vec<Vec<u8>> {
 struct Tty {
     fd: OwnedFd,
     pending: Vec<u8>,
+    /// The descriptor shares its file description with the polkit agent.
+    /// It may block, and its flags must not change, so the module reads
+    /// only the bytes that `FIONREAD` reports.
+    shared: bool,
 }
 
 /// A device number as (major, minor).
@@ -424,11 +429,8 @@ struct Expected {
 }
 
 impl Tty {
-    /// Opens `path` read-only and non-blocking. Returns `None` unless it is
-    /// a character device with a terminal in line mode, and, with
-    /// `expected`, unless it has that device number and owner. Discards the
-    /// input that waits already, so that only lines from the wait count.
-    fn open(path: &Path, expected: Option<Expected>) -> Option<Self> {
+    /// Opens `path` read-only and non-blocking. See [`Tty::adopt`].
+    fn open(path: &Path) -> Option<Self> {
         let path = CString::new(path.as_os_str().as_bytes()).ok()?;
         // SAFETY: `path` is a C string. The flags open no controlling
         // terminal and do not block.
@@ -442,7 +444,15 @@ impl Tty {
             return None;
         }
         // SAFETY: `open` returned a new descriptor that nothing else owns.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        Self::adopt(unsafe { OwnedFd::from_raw_fd(fd) }, None, false)
+    }
+
+    /// Returns `fd` as a terminal unless it is no character device, no
+    /// terminal in line mode, or, with `expected`, another device or owner.
+    /// Discards the input that waits already, so that only lines from the
+    /// wait count. Never changes the terminal settings or the file status
+    /// flags.
+    fn adopt(fd: OwnedFd, expected: Option<Expected>, shared: bool) -> Option<Self> {
         let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
         // SAFETY: `status` has room for a stat structure.
         if unsafe { libc::fstat(fd.as_raw_fd(), status.as_mut_ptr()) } != 0 {
@@ -471,19 +481,44 @@ impl Tty {
         let mut tty = Self {
             fd,
             pending: Vec::new(),
+            shared,
         };
         tty.read_lines().ok()?;
         tty.pending.clear();
         Some(tty)
     }
 
+    /// Returns the number of bytes in complete lines that wait. In line
+    /// mode, `FIONREAD` counts only complete lines.
+    fn available(&self) -> io::Result<usize> {
+        let mut count: c_int = 0;
+        // SAFETY: FIONREAD writes one int.
+        if unsafe { libc::ioctl(self.fd.as_raw_fd(), libc::FIONREAD, &raw mut count) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
+    /// Returns true if a read cannot block: always for an own non-blocking
+    /// descriptor, and for a shared one if a complete line waits.
+    fn has_input(&self) -> bool {
+        !self.shared || self.available().is_ok_and(|count| count > 0)
+    }
+
     /// Reads the input that waits and returns the complete lines.
     fn read_lines(&mut self) -> io::Result<Vec<Vec<u8>>> {
         let mut chunk = [0_u8; 1024];
         loop {
-            // SAFETY: `chunk` is valid for its length.
-            let count =
-                unsafe { libc::read(self.fd.as_raw_fd(), chunk.as_mut_ptr().cast(), chunk.len()) };
+            let size = if self.shared {
+                match self.available()? {
+                    0 => break,
+                    count => count.min(chunk.len()),
+                }
+            } else {
+                chunk.len()
+            };
+            // SAFETY: `chunk` is valid for `size` bytes.
+            let count = unsafe { libc::read(self.fd.as_raw_fd(), chunk.as_mut_ptr().cast(), size) };
             match usize::try_from(count) {
                 // The end-of-file character, or no more input.
                 Ok(0) => break,
@@ -551,45 +586,190 @@ fn peer_credentials(fd: RawFd) -> Option<(libc::pid_t, libc::uid_t)> {
     (credentials.pid > 0).then_some((credentials.pid, credentials.uid))
 }
 
-/// Returns the controlling terminal from the text of `/proc/PID/stat`, or
-/// `None` without one. The command name in parentheses can contain any
-/// character, so the fields count from the last `)`.
-fn stat_terminal(stat: &str) -> Option<DeviceNumber> {
+/// The fields of `/proc/PID/stat` that the module uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcessStat {
+    /// The controlling terminal, from `tty_nr`.
+    terminal: Option<DeviceNumber>,
+    /// The start time in clock ticks after boot. It tells a reused pid.
+    start_time: u64,
+}
+
+/// Parses the text of `/proc/PID/stat`. The command name in parentheses
+/// can contain any character, so the fields count from the last `)`.
+fn parse_stat(stat: &str) -> Option<ProcessStat> {
     let rest = &stat[stat.rfind(')')? + 1..];
-    // state, ppid, pgrp, session, tty_nr.
-    let tty_nr: u32 = rest.split_ascii_whitespace().nth(4)?.parse().ok()?;
-    if tty_nr == 0 {
-        return None;
-    }
+    // Field 3 (state) has the index 0.
+    let fields: Vec<&str> = rest.split_ascii_whitespace().collect();
+    let tty_nr: u32 = fields.get(7 - 3)?.parse().ok()?;
+    let start_time: u64 = fields.get(22 - 3)?.parse().ok()?;
     // The kernel encodes the device as in new_encode_dev.
     let major = (tty_nr >> 8) & 0xfff;
     let minor = (tty_nr & 0xff) | ((tty_nr >> 12) & 0xf_ff00);
-    Some((major, minor))
+    Some(ProcessStat {
+        terminal: (tty_nr != 0).then_some((major, minor)),
+        start_time,
+    })
 }
 
-/// Returns the path of a terminal device: `/dev/pts/N` for a Unix98
-/// pseudo terminal, `/dev/ttyN` for a virtual console. [`Tty::open`]
-/// checks the device number of the path.
-fn terminal_path((major, minor): DeviceNumber) -> Option<PathBuf> {
-    match major {
-        136..=143 => Some(PathBuf::from(format!(
-            "/dev/pts/{}",
-            (major - 136) * 256 + minor
-        ))),
-        4 if (1..=63).contains(&minor) => Some(PathBuf::from(format!("/dev/tty{minor}"))),
-        _ => None,
+fn process_stat(pid: libc::pid_t) -> Option<ProcessStat> {
+    parse_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// Returns the descriptor of `pid` that refers to the terminal `device`:
+/// 0, 1, or 2 first, then the others in order.
+fn terminal_descriptor(pid: libc::pid_t, device: DeviceNumber) -> Option<RawFd> {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+    let directory = format!("/proc/{pid}/fd");
+    let mut descriptors: Vec<RawFd> = std::fs::read_dir(&directory)
+        .ok()?
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+        .collect();
+    descriptors.sort_by_key(|fd| (*fd > 2, *fd));
+    descriptors.into_iter().find(|fd| {
+        // The magic link stats the open file itself, without a path lookup
+        // and without opening the device.
+        std::fs::metadata(format!("{directory}/{fd}")).is_ok_and(|metadata| {
+            let rdev = libc::dev_t::from(metadata.rdev());
+            metadata.file_type().is_char_device()
+                && (libc::major(rdev), libc::minor(rdev)) == device
+        })
+    })
+}
+
+/// `SO_PEERPIDFD` (Linux 6.5) on the architectures with the generic socket
+/// option numbers.
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "x86",
+    target_arch = "aarch64",
+    target_arch = "arm",
+    target_arch = "riscv64",
+    target_arch = "loongarch64"
+))]
+const SO_PEERPIDFD: Option<c_int> = Some(77);
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "x86",
+    target_arch = "aarch64",
+    target_arch = "arm",
+    target_arch = "riscv64",
+    target_arch = "loongarch64"
+)))]
+const SO_PEERPIDFD: Option<c_int> = None;
+
+/// Returns a pidfd of the peer of the socket `fd`: from `SO_PEERPIDFD`,
+/// or else from `pidfd_open(pid)`.
+fn peer_pidfd(fd: RawFd, pid: libc::pid_t) -> io::Result<OwnedFd> {
+    if let Some(option) = SO_PEERPIDFD {
+        let mut pidfd: c_int = -1;
+        let mut length = libc::socklen_t::try_from(size_of::<c_int>()).unwrap_or(0);
+        // SAFETY: `pidfd` has room for an int. Older kernels give
+        // ENOPROTOOPT.
+        let result = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                (&raw mut pidfd).cast(),
+                &raw mut length,
+            )
+        };
+        if result == 0 && pidfd >= 0 {
+            // SAFETY: the kernel returned a new descriptor.
+            return Ok(unsafe { OwnedFd::from_raw_fd(pidfd) });
+        }
     }
+    // SAFETY: pidfd_open takes a pid and flags.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    let pidfd = RawFd::try_from(pidfd).map_err(|_| io::Error::other("bad pidfd"))?;
+    if pidfd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the kernel returned a new descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(pidfd) })
 }
 
-/// Opens the controlling terminal of the peer of `fd`, if `fd` is a Unix
+/// Returns true if `pidfd_getfd` can run. Under a seccomp filter, such as
+/// the one of `polkit-agent-helper@.service`, a filtered call can kill the
+/// process, so a child tries it first.
+fn pidfd_getfd_allowed() -> bool {
+    let filtered = std::fs::read_to_string("/proc/self/status").map_or(true, |status| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("Seccomp:"))
+            .is_none_or(|mode| mode.trim() != "0")
+    });
+    if !filtered {
+        return true;
+    }
+    // SAFETY: the child makes one system call and exits without running
+    // any other code of the process.
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        // SAFETY: an invalid pidfd gives EBADF if the call is allowed.
+        unsafe {
+            let result = libc::syscall(libc::SYS_pidfd_getfd, -1, 0, 0);
+            let allowed = result < 0 && *libc::__errno_location() == libc::EBADF;
+            libc::_exit(i32::from(!allowed));
+        }
+    }
+    if child < 0 {
+        return false;
+    }
+    let mut status = 0;
+    // SAFETY: `child` is a child of this process.
+    if unsafe { libc::waitpid(child, &raw mut status, 0) } != child {
+        return false;
+    }
+    libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+}
+
+/// Duplicates the descriptor `target` of the process `pidfd`.
+fn pidfd_getfd(pidfd: &OwnedFd, target: RawFd) -> io::Result<OwnedFd> {
+    // SAFETY: pidfd_getfd takes a pidfd, a descriptor number, and flags.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), target, 0) };
+    let fd = RawFd::try_from(fd).map_err(|_| io::Error::other("bad descriptor"))?;
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the kernel returned a new descriptor with FD_CLOEXEC.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Returns the controlling terminal of the peer of `fd`, if `fd` is a Unix
 /// stream socket, the terminal is in line mode, and the user of the peer
 /// owns it. The socket-activated polkit agent helper talks to the polkit
 /// agent, for example pkttyagent, through its standard input.
-fn peer_terminal(fd: RawFd) -> Option<Tty> {
-    let (pid, uid) = peer_credentials(fd)?;
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let device = stat_terminal(&stat)?;
-    Tty::open(&terminal_path(device)?, Some(Expected { device, uid }))
+///
+/// The module does not open the device. It duplicates the descriptor that
+/// the peer holds for its terminal with `pidfd_getfd`, which needs ptrace
+/// rights over the peer. The duplicate shares the file description with
+/// the peer, so the module never changes its flags. An error means that
+/// the system denies the duplication.
+fn peer_terminal(fd: RawFd) -> Result<Option<Tty>, String> {
+    let Some((pid, uid)) = peer_credentials(fd) else {
+        return Ok(None);
+    };
+    let Some(before) = process_stat(pid) else {
+        return Ok(None);
+    };
+    let Some(device) = before.terminal else {
+        return Ok(None);
+    };
+    let pidfd = peer_pidfd(fd, pid).map_err(|error| format!("pidfd_open: {error}"))?;
+    // The pid could belong to another process now. The start time tells.
+    if process_stat(pid).map(|after| after.start_time) != Some(before.start_time) {
+        return Ok(None);
+    }
+    let Some(target) = terminal_descriptor(pid, device) else {
+        return Ok(None);
+    };
+    if !pidfd_getfd_allowed() {
+        return Err("pidfd_getfd is not allowed".to_owned());
+    }
+    let duplicate = pidfd_getfd(&pidfd, target).map_err(|error| format!("pidfd_getfd: {error}"))?;
+    Ok(Tty::adopt(duplicate, Some(Expected { device, uid }), true))
 }
 
 /// Opens the terminal of the application, if it is one in line mode:
@@ -606,11 +786,21 @@ unsafe fn terminal(pamh: *mut PamHandle) -> Option<Tty> {
     {
         // SAFETY: PAM_TTY is a C string.
         let item = unsafe { CStr::from_ptr(item.cast()) }.to_bytes();
-        tty_path(item).and_then(|path| Tty::open(&path, None))
+        tty_path(item).and_then(|path| Tty::open(&path))
     } else {
         None
     };
-    tty.or_else(|| peer_terminal(libc::STDIN_FILENO))
+    tty.or_else(|| match peer_terminal(libc::STDIN_FILENO) {
+        Ok(tty) => tty,
+        Err(error) => {
+            log(
+                pamh,
+                LOG_DEBUG,
+                &format!("no terminal of the peer: {error}"),
+            );
+            None
+        }
+    })
 }
 
 /// Returns the command that runs the helper.
@@ -886,7 +1076,16 @@ impl Session {
             } else if terminal.revents & libc::POLLIN != 0
                 && let Some(open) = tty.as_mut()
             {
-                match open.read_lines() {
+                // A shared descriptor is readable but has no complete line
+                // if the agent took the input first, or after the
+                // end-of-file character. A read could then block, so the
+                // watch ends.
+                let lines = if open.has_input() {
+                    open.read_lines()
+                } else {
+                    Err(io::ErrorKind::WouldBlock.into())
+                };
+                match lines {
                     Ok(lines) => {
                         for line in lines {
                             // The reply comes through the loop. The helper
@@ -1546,7 +1745,7 @@ mod tests {
         // Input from before the wait does not count.
         pty.type_text(b"stale\n");
         std::thread::sleep(Duration::from_millis(200));
-        let mut tty = Tty::open(&pty.path, None).expect("a terminal in line mode");
+        let mut tty = Tty::open(&pty.path).expect("a terminal in line mode");
         assert!(tty.read_lines().unwrap().is_empty());
         pty.type_text(b"x\n\n");
         assert_eq!(tty_lines(&mut tty, 2), [&b"x"[..], b""]);
@@ -1556,56 +1755,51 @@ mod tests {
     fn tty_without_line_mode_or_a_terminal_is_not_read() {
         let pty = Pty::new();
         pty.set_line_mode(false);
-        assert!(Tty::open(&pty.path, None).is_none());
+        assert!(Tty::open(&pty.path).is_none());
         pty.set_line_mode(true);
-        assert!(Tty::open(&pty.path, None).is_some());
+        assert!(Tty::open(&pty.path).is_some());
         // A character device that is not a terminal.
-        assert!(Tty::open(Path::new("/dev/null"), None).is_none());
+        assert!(Tty::open(Path::new("/dev/null")).is_none());
         // A regular file, and a missing file.
-        assert!(Tty::open(Path::new("/proc/self/status"), None).is_none());
-        assert!(Tty::open(Path::new("/dev/pam-biometrics-missing"), None).is_none());
+        assert!(Tty::open(Path::new("/proc/self/status")).is_none());
+        assert!(Tty::open(Path::new("/dev/pam-biometrics-missing")).is_none());
     }
 
     #[test]
-    fn stat_terminals() {
-        let stat = |tty_nr: u32| format!("4321 (pkt) ty) (agent) S 1 4321 4321 {tty_nr} 4321 0 0");
-        assert_eq!(stat_terminal(&stat(34816)), Some((136, 0)));
+    fn process_stats() {
+        let stat = |tty_nr: u32| {
+            format!(
+                "4321 (pkt) ty) (agent) S 1 4321 4321 {tty_nr} 4321 0 0 0 0 0 0 0 0 0 20 0 1 0 98765 0"
+            )
+        };
+        let terminal = |tty_nr| parse_stat(&stat(tty_nr)).unwrap().terminal;
+        assert_eq!(terminal(34816), Some((136, 0)));
         // pts/300: the minor needs more than 8 bits.
-        let pts_300 = (0x12c & 0xff) | (136 << 8) | ((0x12c & !0xff) << 12);
-        assert_eq!(stat_terminal(&stat(pts_300)), Some((136, 300)));
-        assert_eq!(stat_terminal(&stat(1025)), Some((4, 1)));
-        assert_eq!(stat_terminal(&stat(0)), None);
-        assert_eq!(stat_terminal("4321 (agent) S 1"), None);
-        assert_eq!(stat_terminal("garbage"), None);
-    }
-
-    #[test]
-    fn terminal_paths() {
-        assert_eq!(terminal_path((136, 0)), Some(PathBuf::from("/dev/pts/0")));
         assert_eq!(
-            terminal_path((136, 300)),
-            Some(PathBuf::from("/dev/pts/300"))
+            terminal((0x12c & 0xff) | (136 << 8) | ((0x12c & !0xff) << 12)),
+            Some((136, 300))
         );
-        assert_eq!(terminal_path((137, 5)), Some(PathBuf::from("/dev/pts/261")));
-        assert_eq!(terminal_path((4, 1)), Some(PathBuf::from("/dev/tty1")));
-        assert_eq!(terminal_path((4, 63)), Some(PathBuf::from("/dev/tty63")));
-        for device in [(4, 0), (4, 64), (5, 0), (5, 1), (1, 3), (144, 0)] {
-            assert_eq!(terminal_path(device), None, "{device:?}");
-        }
+        assert_eq!(terminal(1025), Some((4, 1)));
+        assert_eq!(terminal(0), None);
+        assert_eq!(parse_stat(&stat(0)).unwrap().start_time, 98765);
+        assert_eq!(parse_stat("4321 (agent) S 1 4321 4321 34816"), None);
+        assert_eq!(parse_stat("garbage"), None);
+        // This process.
+        // SAFETY: getpid cannot fail.
+        let own = process_stat(unsafe { libc::getpid() }).unwrap();
+        assert!(own.start_time > 0);
     }
 
     /// Starts a child process that connects to a new listener, as
     /// pkttyagent connects to the polkit agent helper. With `terminal`, the
-    /// child makes it its controlling terminal first. Returns the child and
-    /// the accepted socket. A socket pair would not do: its peer
-    /// credentials name the process that created the pair.
-    fn peer(terminal: Option<RawFd>) -> (Child, UnixStream) {
+    /// child holds it as its standard output and makes it its controlling
+    /// terminal. Returns the child and the accepted socket. A socket pair
+    /// would not do: its peer credentials name the process that created the
+    /// pair.
+    fn peer(name: &str, terminal: Option<&Pty>) -> (Child, UnixStream) {
         use std::os::unix::process::CommandExt as _;
-        let directory = std::env::temp_dir().join(format!(
-            "pam-biometrics-peer-{}-{}",
-            std::process::id(),
-            terminal.unwrap_or(-1)
-        ));
+        let directory =
+            std::env::temp_dir().join(format!("pam-biometrics-peer-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("socket");
         let _ = std::fs::remove_file(&path);
@@ -1619,16 +1813,19 @@ mod tests {
         let length = libc::socklen_t::try_from(size_of::<libc::sockaddr_un>()).unwrap();
         let mut command = Command::new("sleep");
         command.arg("30").stdin(Stdio::null());
+        let with_terminal = terminal.is_some();
+        if let Some(pty) = terminal {
+            command.stdout(Stdio::from(pty.slave.try_clone().unwrap()));
+        }
         // SAFETY: setsid, ioctl, socket, connect, and dup2 are
-        // async-signal-safe. The closure allocates nothing.
+        // async-signal-safe. The closure allocates nothing. Standard output
+        // is in place when it runs.
         unsafe {
             command.pre_exec(move || {
                 if libc::setsid() < 0 {
                     return Err(io::Error::last_os_error());
                 }
-                if let Some(terminal) = terminal
-                    && libc::ioctl(terminal, libc::TIOCSCTTY, 0) < 0
-                {
+                if with_terminal && libc::ioctl(libc::STDOUT_FILENO, libc::TIOCSCTTY, 0) < 0 {
                     return Err(io::Error::last_os_error());
                 }
                 let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
@@ -1647,19 +1844,43 @@ mod tests {
         (child, ours)
     }
 
+    /// Returns the file status flags of a descriptor of `pid`.
+    fn descriptor_flags(pid: u32, fd: RawFd) -> String {
+        std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}"))
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("flags:"))
+            .unwrap()
+            .trim()
+            .to_owned()
+    }
+
     #[test]
-    fn peer_terminal_finds_the_controlling_terminal_of_the_peer() {
+    fn peer_terminal_duplicates_the_terminal_of_the_peer() {
+        assert!(pidfd_getfd_allowed());
         let pty = Pty::new();
-        let (mut child, ours) = peer(Some(pty.slave.as_raw_fd()));
+        let (mut child, ours) = peer("terminal", Some(&pty));
         // The child sets its terminal before exec. Wait for the exec.
         let deadline = Instant::now() + Duration::from_secs(5);
-        let tty = loop {
-            if let Some(tty) = peer_terminal(ours.as_raw_fd()) {
-                break tty;
-            }
-            assert!(Instant::now() < deadline, "no terminal of the peer");
+        while process_stat(i32::try_from(child.id()).unwrap())
+            .and_then(|stat| stat.terminal)
+            .is_none()
+        {
+            assert!(Instant::now() < deadline, "the peer has no terminal");
             std::thread::sleep(Duration::from_millis(20));
-        };
+        }
+        assert_eq!(
+            terminal_descriptor(i32::try_from(child.id()).unwrap(), {
+                let stat = process_stat(i32::try_from(child.id()).unwrap()).unwrap();
+                stat.terminal.unwrap()
+            }),
+            Some(1)
+        );
+        let flags = descriptor_flags(child.id(), 1);
+        let tty = peer_terminal(ours.as_raw_fd())
+            .unwrap()
+            .expect("the terminal of the peer");
+        assert!(tty.shared);
         // The trigger line on the terminal of the peer sends `scan` during
         // the wait of finish.
         let mut session = start_helper(&format!(
@@ -1671,16 +1892,28 @@ exit 0"#
         let master = pty.master.try_clone().unwrap();
         let typist = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(200));
-            // SAFETY: one byte from a valid buffer.
-            unsafe { libc::write(master.as_raw_fd(), b"\n".as_ptr().cast(), 1) };
+            // Lines other than the trigger do nothing.
+            // SAFETY: valid buffers.
+            unsafe {
+                libc::write(master.as_raw_fd(), b"no\n".as_ptr().cast(), 3);
+                libc::write(master.as_raw_fd(), b"\n".as_ptr().cast(), 1);
+            }
         });
         let mut conversation = Script::new(&[]);
         let status = exited(session.finish(&mut conversation, Some(tty)));
         typist.join().unwrap();
         assert_eq!(pam_result(status.code()), PAM_SUCCESS);
         assert_eq!(conversation.infos, ["Wait.", "got scan"]);
+        // The shared file description kept its flags: no O_NONBLOCK.
+        assert_eq!(descriptor_flags(child.id(), 1), flags);
 
-        // The terminal must belong to the user of the peer.
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn adopt_checks_the_device_and_the_owner() {
+        let pty = Pty::new();
         let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
         // SAFETY: `status` has room for a stat structure.
         assert_eq!(
@@ -1691,29 +1924,41 @@ exit 0"#
         let status = unsafe { status.assume_init() };
         let device = (libc::major(status.st_rdev), libc::minor(status.st_rdev));
         let uid = status.st_uid;
-        assert!(Tty::open(&pty.path, Some(Expected { device, uid })).is_some());
+        let adopt = |expected| Tty::adopt(pty.slave.try_clone().unwrap(), Some(expected), true);
+        assert!(adopt(Expected { device, uid }).is_some());
         assert!(
-            Tty::open(
-                &pty.path,
-                Some(Expected {
-                    device,
-                    uid: uid + 1
-                })
-            )
+            adopt(Expected {
+                device,
+                uid: uid + 1
+            })
             .is_none()
         );
-        let other = (device.0, device.1 + 1);
-        assert!(Tty::open(&pty.path, Some(Expected { device: other, uid })).is_none());
-
-        child.kill().unwrap();
-        child.wait().unwrap();
+        assert!(
+            adopt(Expected {
+                device: (device.0, device.1 + 1),
+                uid
+            })
+            .is_none()
+        );
+        // The shared descriptor blocks, so the module reads only what waits.
+        let mut tty = adopt(Expected { device, uid }).unwrap();
+        assert!(!tty.has_input());
+        assert!(tty.read_lines().unwrap().is_empty());
+        pty.type_text(b"partial");
+        std::thread::sleep(Duration::from_millis(100));
+        // A partial line is no input in line mode.
+        assert!(!tty.has_input());
+        pty.type_text(b"\n");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(tty.has_input());
+        assert_eq!(tty.read_lines().unwrap(), [&b"partial"[..]]);
     }
 
     #[test]
     fn peer_terminal_needs_a_socket_peer_with_a_terminal() {
         // A peer without a controlling terminal.
-        let (mut child, ours) = peer(None);
-        assert!(peer_terminal(ours.as_raw_fd()).is_none());
+        let (mut child, ours) = peer("no-terminal", None);
+        assert!(peer_terminal(ours.as_raw_fd()).unwrap().is_none());
         child.kill().unwrap();
         child.wait().unwrap();
 
@@ -1722,6 +1967,7 @@ exit 0"#
         assert!(peer_credentials(datagram.as_raw_fd()).is_none());
         let pty = Pty::new();
         assert!(peer_credentials(pty.slave.as_raw_fd()).is_none());
+        assert!(peer_terminal(pty.slave.as_raw_fd()).unwrap().is_none());
         let file = std::fs::File::open("/dev/null").unwrap();
         assert!(peer_credentials(file.as_raw_fd()).is_none());
 
@@ -1744,7 +1990,7 @@ exit 0"#
         );
         let mut session = start_helper(&script);
         let pty = Pty::new();
-        let tty = Tty::open(&pty.path, None).expect("a terminal in line mode");
+        let tty = Tty::open(&pty.path).expect("a terminal in line mode");
         let typist = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(200));
             // Lines other than the trigger do nothing.

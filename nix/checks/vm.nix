@@ -458,6 +458,31 @@ testers.runNixOSTest {
         assert "other text skips" not in output, output
         assert elapsed < 8, elapsed
 
+    with subtest("the polkit agent helper may duplicate descriptors, not open terminals"):
+        unit = machine.succeed("systemctl cat polkit-agent-helper@.service")
+        print(unit)
+        assert "SystemCallFilter=@system-service" in unit, unit
+        assert "SystemCallFilter=pidfd_getfd" in unit, unit
+        assert "char-pts" not in unit, unit
+        assert "DeviceAllow=/dev/null rw" in unit, unit
+
+    with subtest("run0 on a virtual console: Enter during the wait scans the face"):
+        machine.wait_until_tty_matches("1", "login: ")
+        machine.send_chars("alice\n")
+        machine.wait_until_tty_matches("1", "Password: ")
+        machine.send_chars("alice-password\n")
+        machine.wait_until_succeeds("pgrep -u alice -t tty1 bash")
+        machine.send_chars("clear; run0 true; echo run0-status=$?\n")
+        machine.wait_until_tty_matches("1", r"Password \(Enter to scan face\): ")
+        machine.send_chars("alice-password\n")
+        machine.wait_until_tty_matches("1", r"press Enter to scan your face \(8 s\)")
+        machine.send_chars("\n")
+        machine.wait_until_tty_matches("1", "Face recognized")
+        machine.wait_until_tty_matches("1", "run0-status=0")
+        print(machine.get_tty_text("1"))
+        no_helper()
+        machine.send_chars("exit\n")
+
     with subtest("an empty factor list leaves the prompt to pam_unix"):
         status, output, elapsed = converse("test-none", "?Password: ", PASSWORD)
         assert status == 0, output

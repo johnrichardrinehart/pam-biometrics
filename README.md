@@ -113,35 +113,55 @@ The module finds the terminal in this order:
 2. Otherwise the controlling terminal of the client at the other end of the
    standard input, if the standard input is a Unix stream socket. polkit
    127 runs `polkit-agent-helper-1` socket-activated: its standard input is
-   a socket to the polkit agent, and `PAM_TTY` is unset. The module reads
-   the peer process from `SO_PEERCRED`, its controlling terminal from
-   `tty_nr` in `/proc/PID/stat`, and opens `/dev/pts/N` or `/dev/ttyN`
-   only if the device number of the opened file is that terminal and the
-   user of the peer owns it.
+   a socket to the polkit agent, for example `pkttyagent` under `run0`,
+   and `PAM_TTY` is unset. The module does not open the terminal device:
+   - It takes the peer process from `SO_PEERCRED`, and a pidfd of it from
+     `SO_PEERPIDFD` or `pidfd_open`. The start time in `/proc/PID/stat`
+     before and after shows that the pid still names the same process.
+   - It reads the controlling terminal from `tty_nr` in `/proc/PID/stat`
+     and finds the descriptor of the peer for it in `/proc/PID/fd`: the
+     character device with that device number, fd 0, 1, or 2 first.
+   - It duplicates that descriptor with `pidfd_getfd`, and keeps it only if
+     it is that terminal, owned by the user of the peer.
+
+   The duplicate shares its file description with the agent. The module
+   never changes its file status flags or terminal settings. It waits with
+   `poll` and reads only the complete lines that `FIONREAD` reports, so a
+   read never blocks. If the agent takes the input first, the watch ends.
 
 Rules for both:
 
 - `PAM_TTY` can be a name such as `tty1` or `pts/3`, or a path under
   `/dev/`. Other values, such as an X display `:0`, mean no terminal.
-- The module opens the terminal read-only and non-blocking, and only if it
-  is a character device in line mode. It never changes the terminal
-  settings. It does not read a terminal without `ICANON`, such as a greeter
-  that draws in raw mode. It discards the input that waits when the wait
-  starts, and closes the terminal before `finish` returns.
+- The module uses a terminal only if it is a character device in line
+  mode. It never changes the terminal settings. It does not read a terminal
+  without `ICANON`, such as a greeter that draws in raw mode. It discards
+  the input that waits when the wait starts, and closes its descriptor
+  before `finish` returns. It opens `PAM_TTY` read-only and non-blocking.
 - The module reads the terminal only during the wait, and nothing it reads
   is a secret: a line only decides whether to start a scan. The password
   comes from the prompt of `start`.
 - Graphical clients have no terminal. A key binding starts a scan there,
   or `"after_password": "prompt"` gives the user one prompt in the client.
-- The fallback reads only the terminal of the client that runs the
-  authentication, owned by the user of that client, the same terminal where
+
+Security of the fallback:
+
+- It grants no device access. The helper unit keeps its device policy,
+  which allows only `/dev/null`.
+- It reaches only the descriptor that the connecting agent already holds
+  for its own terminal, owned by the user of the agent: the terminal where
   the user just typed the password into the agent. It reads only during the
-  wait and only to detect the trigger line. Nothing read there is used as a
-  secret.
-- The NixOS module allows the sandboxed `polkit-agent-helper@.service` to
-  read pseudo terminals (`DeviceAllow=char-pts r`). The upstream unit
-  allows only `/dev/null`. Its private `/dev` has no virtual consoles, so a
-  `pkttyagent` on a virtual console has no trigger during the wait.
+  wait and only to detect the trigger line.
+- It relies on the ptrace rights that the helper has already: it runs as
+  root with `CAP_SYS_PTRACE`, which `pidfd_getfd` and Yama scope 1 need. It
+  fails closed: without those rights, or without the system call, the watch
+  does not start, and the module logs the reason at the debug level. The
+  fingerprint and the key binding still work.
+- `pidfd_getfd` is not in the `@system-service` system call filter of
+  `polkit-agent-helper@.service`. The NixOS module adds it to the filter.
+  Elsewhere, add `SystemCallFilter=pidfd_getfd` in a drop-in. A filtered
+  call would kill the helper, so the module first tries the call in a
+  child process when a seccomp filter is active.
 
 The factors run like this:
 

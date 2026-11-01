@@ -160,12 +160,13 @@ in
     security.polkit.enable = true;
 
     # The socket-activated polkit agent helper has no PAM_TTY. During the
-    # wait of finish, pam_biometrics.so reads trigger lines from the
-    # controlling terminal of the agent at the other end of the socket, for
-    # example pkttyagent under run0. The upstream unit allows only
-    # /dev/null. PrivateDevices keeps /dev/pts, so read access to the
-    # pseudo terminals is enough.
-    systemd.services."polkit-agent-helper@".serviceConfig.DeviceAllow = [ "char-pts r" ];
+    # wait of finish, pam_biometrics.so watches the controlling terminal of
+    # the agent at the other end of the socket, for example pkttyagent
+    # under run0. It duplicates the descriptor that the agent holds with
+    # pidfd_getfd, so the unit needs no device access. pidfd_getfd is in
+    # @debug, not in the @system-service filter of the unit. This line adds
+    # it to that filter; it removes nothing.
+    systemd.services."polkit-agent-helper@".serviceConfig.SystemCallFilter = [ "pidfd_getfd" ];
 
     environment.etc."pam-biometrics/policy.json".source = policyFile;
 

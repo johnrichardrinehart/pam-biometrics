@@ -1,7 +1,15 @@
 //! The fingerprint factor through fprintd on the system D-Bus.
 //!
 //! The factor verifies until a match, a reject, or a stop. After a device
-//! error, a lost device, or a missing device, it starts again after a pause.
+//! error, it starts a new verification on the same claim after a pause.
+//! After a bus error or a missing device, it releases the device and claims
+//! it again after a pause.
+//!
+//! The factor never releases the device because of a device error. A
+//! suspend cancels a running verification with a device error, and a
+//! `Release` during the suspend fails in libfprint while fprintd forgets
+//! the claim anyway: the device stays open, and every later `Claim` fails
+//! with "The device has already been opened!" until fprintd exits.
 
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -9,6 +17,7 @@ use std::thread;
 use std::time::Duration;
 
 use pam_biometrics_policy::{Factor, Outcome};
+use zbus::blocking::proxy::SignalIterator;
 use zbus::blocking::{Connection, Proxy};
 use zbus::zvariant::OwnedObjectPath;
 
@@ -34,6 +43,9 @@ pub enum Action {
     Restart(&'static str),
     /// End the factor with an outcome.
     Finish(Outcome),
+    /// The device failed. Keep the claim, pause, and start a new
+    /// verification.
+    Fail,
 }
 
 /// Counts the tries of one verification.
@@ -74,7 +86,7 @@ impl Tries {
             "verify-finger-not-centered" => retry("Center your finger on the reader. Try again."),
             "verify-remove-and-retry" => retry("Remove your finger. Then try again."),
             // verify-disconnected, verify-unknown-error, and unknown results.
-            _ => Action::Finish(Outcome::NoDecision),
+            _ => Action::Fail,
         }
     }
 }
@@ -136,26 +148,45 @@ impl FactorTask for FingerprintTask {
         thread::spawn(move || {
             // Wrong fingers count across restarts.
             let mut tries = Tries::new(self.max_tries);
-            let mut backoff = MIN_BACKOFF;
+            let mut backoff = Backoff::default();
             loop {
-                let mut started = false;
-                let outcome = verify(&shared, &self.user, &mut tries, &mut started, &events)
+                let outcome = verify(&shared, &self.user, &mut tries, &mut backoff, &events)
                     .unwrap_or(Outcome::NoDecision);
                 lock(&shared).release();
                 if outcome != Outcome::NoDecision {
                     let _ = events.send(Event::Finished(Factor::Fingerprint, outcome));
                     return;
                 }
-                if started {
-                    backoff = MIN_BACKOFF;
-                }
-                if !pause(backoff, || lock(&shared).stopped) {
+                if !backoff.pause(&shared) {
                     return;
                 }
-                backoff = (backoff * 2).min(MAX_BACKOFF);
             }
         });
         Box::new(FingerprintStop(session))
+    }
+}
+
+/// The pause before a new verification after an error.
+struct Backoff(Duration);
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self(MIN_BACKOFF)
+    }
+}
+
+impl Backoff {
+    /// A verification started: the next pause is the shortest again.
+    fn reset(&mut self) {
+        self.0 = MIN_BACKOFF;
+    }
+
+    /// Pauses, then doubles the next pause. Returns false if the step
+    /// stopped the factor.
+    fn pause(&mut self, session: &Shared) -> bool {
+        let resumed = pause(self.0, || lock(session).stopped);
+        self.0 = (self.0 * 2).min(MAX_BACKOFF);
+        resumed
     }
 }
 
@@ -169,18 +200,40 @@ fn start_verify(session: &Shared) -> zbus::Result<bool> {
         .device
         .as_ref()
         .expect("the device is set before verification");
+    // "any" accepts every enrolled finger. Without it, fprintd checks only
+    // the first enrolled finger.
     device.call::<_, _, ()>("VerifyStart", &("any",))?;
     session.verifying = true;
     Ok(true)
 }
 
-/// Verifies once. Returns [`Outcome::NoDecision`] after a device error or
-/// a stop. Sets `started` when the verification started.
+/// Stops the verification and keeps the claim.
+fn stop_verify(session: &Shared) -> zbus::Result<()> {
+    let mut guard = lock(session);
+    if let Some(device) = &guard.device {
+        device.call::<_, _, ()>("VerifyStop", &())?;
+    }
+    guard.verifying = false;
+    Ok(())
+}
+
+/// How one verification ended.
+enum Ended {
+    /// A match, a reject, or no decision after a stop or a lost fprintd.
+    Outcome(Outcome),
+    /// The device failed. The claim is still valid.
+    DeviceError,
+}
+
+/// Claims the device and verifies until an outcome. After a device error,
+/// it keeps the claim and starts a new verification after a pause. Returns
+/// [`Outcome::NoDecision`] after a stop or a lost fprintd, and an error
+/// after a bus error. The caller releases the device in every case.
 fn verify(
     session: &Shared,
     user: &str,
     tries: &mut Tries,
-    started: &mut bool,
+    backoff: &mut Backoff,
     events: &Sender<Event>,
 ) -> zbus::Result<Outcome> {
     let connection = Connection::system()?;
@@ -199,16 +252,33 @@ fn verify(
         guard.claimed = true;
     }
 
-    // "any" accepts every enrolled finger. Without it, fprintd checks only
-    // the first enrolled finger.
-    if !start_verify(session)? {
-        return Ok(Outcome::NoDecision);
+    loop {
+        if !start_verify(session)? {
+            return Ok(Outcome::NoDecision);
+        }
+        backoff.reset();
+        match watch(session, &mut statuses, tries, events)? {
+            Ended::Outcome(outcome) => return Ok(outcome),
+            Ended::DeviceError => {
+                stop_verify(session)?;
+                if !backoff.pause(session) {
+                    return Ok(Outcome::NoDecision);
+                }
+            }
+        }
     }
-    *started = true;
+}
+
+/// Follows a started verification until it ends.
+fn watch(
+    session: &Shared,
+    statuses: &mut SignalIterator<'_>,
+    tries: &mut Tries,
+    events: &Sender<Event>,
+) -> zbus::Result<Ended> {
     for message in statuses.by_ref() {
         let (result, done): (String, bool) = message.body().deserialize()?;
-        let action = tries.on_status(&result, done);
-        match action {
+        match tries.on_status(&result, done) {
             Action::Wait(message) => {
                 if let Some(message) = message {
                     let _ = events.send(Event::Message(message.to_owned()));
@@ -216,21 +286,17 @@ fn verify(
             }
             Action::Restart(message) => {
                 let _ = events.send(Event::Message(message.to_owned()));
-                {
-                    let mut guard = lock(session);
-                    if let Some(device) = &guard.device {
-                        device.call::<_, _, ()>("VerifyStop", &())?;
-                    }
-                    guard.verifying = false;
-                }
+                stop_verify(session)?;
                 if !start_verify(session)? {
-                    return Ok(Outcome::NoDecision);
+                    return Ok(Ended::Outcome(Outcome::NoDecision));
                 }
             }
-            Action::Finish(outcome) => return Ok(outcome),
+            Action::Finish(outcome) => return Ok(Ended::Outcome(outcome)),
+            Action::Fail => return Ok(Ended::DeviceError),
         }
     }
-    Ok(Outcome::NoDecision)
+    // The bus closed the stream: fprintd is gone.
+    Ok(Ended::Outcome(Outcome::NoDecision))
 }
 
 #[cfg(test)]
@@ -307,18 +373,18 @@ mod tests {
     }
 
     #[test]
-    fn device_errors_give_no_decision() {
-        let mut tries = Tries::new(3);
+    fn device_errors_keep_the_claim() {
+        let mut tries = Tries::new(1);
         for result in [
             "verify-disconnected",
             "verify-unknown-error",
             "verify-something-new",
         ] {
-            assert_eq!(
-                tries.on_status(result, true),
-                Action::Finish(Outcome::NoDecision),
-                "{result}"
-            );
+            assert_eq!(tries.on_status(result, true), Action::Fail, "{result}");
         }
+        assert_eq!(
+            tries.on_status("verify-no-match", true),
+            Action::Finish(Outcome::Reject)
+        );
     }
 }

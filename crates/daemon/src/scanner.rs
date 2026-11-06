@@ -49,16 +49,18 @@ pub struct CameraScanner {
 
 impl CameraScanner {
     /// Calls `visit` with the faces of each frame that is bright enough.
-    /// `visit` returns false to stop the capture.
+    /// `visit` returns false to stop the capture. Returns the number of
+    /// frames that were too dark.
     fn each_frame(
         &mut self,
         duration: Duration,
         mut visit: impl FnMut(Vec<pam_biometrics_face::Face>) -> bool,
-    ) -> Result<(), String> {
+    ) -> Result<usize, String> {
         let mut capture = self
             .camera
             .capture(duration)
             .map_err(|error| format!("cannot start ffmpeg: {error}"))?;
+        let mut dark = 0;
         while let Some(rgb) = capture.next_frame() {
             let frame = Frame {
                 rgb,
@@ -66,6 +68,7 @@ impl CameraScanner {
                 height: self.camera.height,
             };
             if frame.brightness() < self.dark_threshold {
+                dark += 1;
                 continue;
             }
             let faces = self
@@ -76,7 +79,7 @@ impl CameraScanner {
                 break;
             }
         }
-        Ok(())
+        Ok(dark)
     }
 }
 
@@ -103,16 +106,29 @@ impl Scanner for CameraScanner {
 
     fn enroll(&mut self) -> Result<Vec<Encoding>, String> {
         let mut samples = Vec::new();
-        self.each_frame(self.enroll_duration, |mut faces| {
-            if faces.len() == 1 {
-                samples.push(faces.remove(0).encoding);
+        let (mut no_face, mut several) = (0, 0);
+        let dark = self.each_frame(self.enroll_duration, |mut faces| {
+            match faces.len() {
+                0 => no_face += 1,
+                1 => samples.push(faces.remove(0).encoding),
+                _ => several += 1,
             }
             true
         })?;
         if samples.len() < MIN_ENROLL_SAMPLES {
+            let frames = dark + no_face + several + samples.len();
+            if frames == 0 {
+                return Err(format!(
+                    "the camera gave no frames in {:.0} s",
+                    self.enroll_duration.as_secs_f64()
+                ));
+            }
             return Err(format!(
-                "{} frames had exactly one face, enrollment needs {MIN_ENROLL_SAMPLES}",
-                samples.len()
+                "{} of {frames} frames had exactly one face, enrollment needs \
+                 {MIN_ENROLL_SAMPLES}: {dark} too dark (mean brightness below {}), \
+                 {no_face} without a face, {several} with more than one face",
+                samples.len(),
+                self.dark_threshold
             ));
         }
         Ok(pick_evenly(&samples, MAX_ENROLL_SAMPLES))

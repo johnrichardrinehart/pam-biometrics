@@ -251,6 +251,9 @@ impl Secret {
 
 impl Drop for Secret {
     fn drop(&mut self) {
+        if self.0.is_null() {
+            return;
+        }
         // SAFETY: The pointer is a valid C string from malloc that this
         // value owns. The volatile writes keep the compiler from removing
         // the zeroes before free.
@@ -308,7 +311,9 @@ impl Conversation for Pam {
                 prompt.as_ptr(),
             )
         };
-        let secret = (!response.is_null()).then_some(Secret(response));
+        // `then`, not `then_some`: `then_some` would build the Secret, and
+        // drop it, for a null response too.
+        let secret = (!response.is_null()).then(|| Secret(response));
         if result == PAM_SUCCESS { secret } else { None }
     }
 
